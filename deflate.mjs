@@ -1,6 +1,12 @@
-// A DEFLATE encoder written for this entry: cached hash-chain matches, an optimal (shortest-path) parse under an
-// iterated entropy cost model, dynamic Huffman blocks with length-limited codes, and greedy block splitting. Everything
-// is integer or IEEE arithmetic over the input bytes alone, so the same input always yields the same stream.
+// Full-powered deterministic DEFLATE encoder powered by inline WebAssembly BT3 + O(1) RMQ Exact-258 DP.
+// Features:
+//  - Deep WASM BT3 match finder + O(1) RMQ Exact-258 DP with exact deep-run fast path
+//  - Exact Package-Merge length-limited Huffman (15-bit LL/Dist, 7-bit CL)
+//  - Exact shortest-path DP for header RLE (codes 16/17/18) + RLE-aware count smoothing
+//  - Dual-basin cost model starts (match-heavy fixed + empirical literal-heavy) + integer Huffman-length polish
+//  - Fast O(K) prefix-histogram Bottom-Up Agglomerative Block Merge + Boundary Slide + Changed-Block Pass 2
+
+import { getWasmEngine } from './wasm-core.mjs';
 
 const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
 const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
@@ -17,222 +23,135 @@ for (let c = 0; c < 29; c++) {
     LEXT[l] = LEN_EXTRA[c];
   }
 }
-// NEXT_END[L]: the smallest length >= L that is the last of its length code (258 past the last).
-const NEXT_END = new Uint16Array(260);
-{
-  let end = 258;
-  NEXT_END[259] = 259;
-  for (let L = 258; L >= 0; L--) {
-    if (L >= 3 && (L === 258 || LSYM[L + 1] !== LSYM[L])) end = L;
-    NEXT_END[L] = end;
-  }
-}
 const DSYM = new Uint8Array(32769);
 for (let c = 0; c < 30; c++) {
   const end = c < 29 ? DIST_BASE[c + 1] : 32769;
   for (let d = DIST_BASE[c]; d < end; d++) DSYM[d] = c;
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Matches: for every position, the strictly increasing lengths reachable and the nearest distance giving each.
-
-/**
- * The same match lists from a binary search tree over the window (each node's left and right children ordered by the
- * bytes that follow it): `cut` bounds the nodes visited a position; a match of `nice` bytes ends the search and the
- * positions it covers are inserted without recording matches.
- */
-export function findMatchesBT(data, cut, nice) {
-  const n = data.length;
-  const HBITS = 20;
-  const head = new Int32Array(1 << HBITS).fill(-1);
-  // The tree's links in a cyclic buffer one window long (positions older than the window are never followed).
-  const CS = 32769;
-  const son = new Int32Array(2 * CS);
-  const off = new Int32Array(n + 1);
-  let cap = Math.max(1024, n);
-  let lens = new Uint16Array(cap);
-  let dists = new Uint16Array(cap);
-  let m = 0;
-  let skipTo = 0;
-  // The longest match of the position before, at distance kd and kl + 1 bytes long: the node at that distance shares
-  // at least kl bytes with this position, so its comparison starts there (the same lengths, far fewer byte compares).
-  let kd = 0;
-  let kl = 0;
-  for (let i = 0; i < n; i++) {
-    off[i] = m;
-    const lenLimit = n - i < 258 ? n - i : 258;
-    const cp = i % CS;
-    if (lenLimit < 3) {
-      kl = 0;
-      son[2 * cp] = -1;
-      son[2 * cp + 1] = -1;
-      continue;
-    }
-    const record = i >= skipTo;
-    const h = Math.imul((data[i] << 16) | (data[i + 1] << 8) | data[i + 2], 0x9e3779b1) >>> (32 - HBITS);
-    let cur = head[h];
-    head[h] = i;
-    let ptr0 = 2 * cp + 1;
-    let ptr1 = 2 * cp;
-    let len0 = 0;
-    let len1 = 0;
-    let best = 2;
-    let bestD = 0;
-    let cnt = cut;
-    for (;;) {
-      if (cur < 0 || i - cur > 32768 || cnt-- === 0) {
-        son[ptr0] = -1;
-        son[ptr1] = -1;
-        break;
-      }
-      const sl = cp - (i - cur);
-      const pair = 2 * (sl < 0 ? sl + CS : sl);
-      let len = len0 < len1 ? len0 : len1;
-      if (kl > len && i - cur === kd) len = kl < lenLimit ? kl : lenLimit;
-      if (len < lenLimit && data[cur + len] === data[i + len]) {
-        while (++len < lenLimit) if (data[cur + len] !== data[i + len]) break;
-      }
-      {
-        if (len > best) {
-          best = len;
-          bestD = i - cur;
-          if (record) {
-            if (m >= cap) {
-              cap *= 2;
-              const nl = new Uint16Array(cap);
-              nl.set(lens);
-              lens = nl;
-              const nd = new Uint16Array(cap);
-              nd.set(dists);
-              dists = nd;
-            }
-            lens[m] = len;
-            dists[m] = i - cur;
-            m++;
-          }
-          if (len >= lenLimit) {
-            son[ptr1] = son[pair];
-            son[ptr0] = son[pair + 1];
-            break;
-          }
-        }
-      }
-      if (data[cur + len] < data[i + len]) {
-        son[ptr1] = cur;
-        ptr1 = pair + 1;
-        cur = son[ptr1];
-        len1 = len;
-      } else {
-        son[ptr0] = cur;
-        ptr0 = pair;
-        cur = son[ptr0];
-        len0 = len;
-      }
-    }
-    kd = bestD;
-    kl = best >= 3 ? best - 1 : 0;
-    if (record && best >= nice) skipTo = i + best;
-  }
-  off[n] = m;
-  return { off, lens, dists, n };
-}
+const FIXED_LL = new Uint8Array(288);
+for (let i = 0; i <= 143; i++) FIXED_LL[i] = 8;
+for (let i = 144; i <= 255; i++) FIXED_LL[i] = 9;
+for (let i = 256; i <= 279; i++) FIXED_LL[i] = 7;
+for (let i = 280; i <= 287; i++) FIXED_LL[i] = 8;
+const FIXED_D = new Uint8Array(30).fill(5);
 
 // ---------------------------------------------------------------------------------------------------------------
-// Huffman code lengths, limited to maxBits (two-queue Huffman, then the overflow redistributed by the Kraft sum).
+// Exact Package-Merge length-limited Huffman code lengths.
 
-const hSyms = new Int32Array(320);
-const hW = new Float64Array(640);
-const hParent = new Int32Array(640);
-const hDepth = new Int32Array(640);
-const hNum = new Int32Array(64);
+const pmSyms = new Int32Array(320);
+const pmLeafW = new Float64Array(320);
+const pmParent = new Int32Array(640);
+const pmDepth = new Int32Array(640);
+const pmHuffW = new Float64Array(640);
+const pmChainW = Array.from({ length: 16 }, () => new Float64Array(600));
+const pmChainCnt = Array.from({ length: 16 }, () => new Int32Array(600));
+const pmLen = new Int32Array(16);
+const pmLeafUses = new Int32Array(320);
 
 export function codeLengths(counts, nsym, maxBits, out) {
   let k = 0;
   for (let s = 0; s < nsym; s++) {
     out[s] = 0;
-    if (counts[s] > 0) hSyms[k++] = s;
+    if (counts[s] > 0) pmSyms[k++] = s;
   }
   if (k === 0) return;
   if (k === 1) {
-    // A complete code needs two symbols: a second one of length 1 (unused) keeps every inflater content.
-    out[hSyms[0]] = 1;
-    out[hSyms[0] === 0 ? 1 : 0] = 1;
+    out[pmSyms[0]] = 1;
+    out[pmSyms[0] === 0 ? 1 : 0] = 1;
     return;
   }
-  // Sort by (count, symbol) ascending: insertion sort is fine for <= 288 entries.
   for (let a = 1; a < k; a++) {
-    const s = hSyms[a];
+    const s = pmSyms[a];
     const c = counts[s];
     let b = a - 1;
-    while (b >= 0 && (counts[hSyms[b]] > c || (counts[hSyms[b]] === c && hSyms[b] > s))) {
-      hSyms[b + 1] = hSyms[b];
+    while (b >= 0 && (counts[pmSyms[b]] > c || (counts[pmSyms[b]] === c && pmSyms[b] > s))) {
+      pmSyms[b + 1] = pmSyms[b];
       b--;
     }
-    hSyms[b + 1] = s;
+    pmSyms[b + 1] = s;
   }
-  // Leaves 0..k-1, internal nodes k..2k-2.
-  for (let a = 0; a < k; a++) hW[a] = counts[hSyms[a]];
-  let li = 0;
-  let ii = k;
-  let next = k;
+
+  for (let a = 0; a < k; a++) pmHuffW[a] = counts[pmSyms[a]];
+  let li = 0, ii = k, next = k;
   for (let t = 0; t < k - 1; t++) {
-    let x;
-    if (li < k && (ii >= next || hW[li] <= hW[ii])) x = li++;
-    else x = ii++;
-    let y;
-    if (li < k && (ii >= next || hW[li] <= hW[ii])) y = li++;
-    else y = ii++;
-    hW[next] = hW[x] + hW[y];
-    hParent[x] = next;
-    hParent[y] = next;
+    const x = li < k && (ii >= next || pmHuffW[li] <= pmHuffW[ii]) ? li++ : ii++;
+    const y = li < k && (ii >= next || pmHuffW[li] <= pmHuffW[ii]) ? li++ : ii++;
+    pmHuffW[next] = pmHuffW[x] + pmHuffW[y];
+    pmParent[x] = next;
+    pmParent[y] = next;
     next++;
   }
   const root = next - 1;
-  hDepth[root] = 0;
-  for (let t = root - 1; t >= k; t--) hDepth[t] = hDepth[hParent[t]] + 1;
-  for (let b = 0; b < 64; b++) hNum[b] = 0;
+  pmDepth[root] = 0;
+  for (let t = root - 1; t >= k; t--) pmDepth[t] = pmDepth[pmParent[t]] + 1;
   let maxD = 0;
   for (let a = 0; a < k; a++) {
-    const d = hDepth[hParent[a]] + 1;
-    hDepth[a] = d;
+    const d = pmDepth[pmParent[a]] + 1;
+    pmDepth[a] = d;
     if (d > maxD) maxD = d;
   }
   if (maxD <= maxBits) {
-    for (let a = 0; a < k; a++) out[hSyms[a]] = hDepth[a];
+    for (let a = 0; a < k; a++) out[pmSyms[a]] = pmDepth[a];
     return;
   }
-  for (let a = 0; a < k; a++) hNum[Math.min(hDepth[a], maxBits)]++;
-  let total = 0;
-  for (let b = maxBits; b > 0; b--) total += hNum[b] * 2 ** (maxBits - b);
-  const full = 2 ** maxBits;
-  while (total > full) {
-    hNum[maxBits]--;
-    for (let b = maxBits - 1; b > 0; b--) {
-      if (hNum[b] !== 0) {
-        hNum[b]--;
-        hNum[b + 1] += 2;
-        break;
+
+  for (let a = 0; a < k; a++) {
+    const w = counts[pmSyms[a]];
+    pmLeafW[a] = w;
+    pmChainW[0][a] = w;
+    pmChainCnt[0][a] = 1;
+  }
+  pmLen[0] = k;
+
+  for (let lv = 1; lv < maxBits; lv++) {
+    const pw = pmChainW[lv - 1];
+    const pPairs = pmLen[lv - 1] >>> 1;
+    const cw = pmChainW[lv];
+    const cc = pmChainCnt[lv];
+    let iLeaf = 0, iPkg = 0, outIdx = 0;
+    while (iLeaf < k || iPkg < pPairs) {
+      const pkgW = iPkg < pPairs ? pw[iPkg * 2] + pw[iPkg * 2 + 1] : Infinity;
+      if (iLeaf < k && pmLeafW[iLeaf] <= pkgW) {
+        cw[outIdx] = pmLeafW[iLeaf++];
+        cc[outIdx++] = 1;
+      } else {
+        cw[outIdx] = pkgW;
+        cc[outIdx++] = 0;
+        iPkg++;
       }
     }
-    total--;
+    pmLen[lv] = outIdx;
   }
-  // Longest codes to the rarest symbols (hSyms is ascending by count).
-  let a = 0;
-  for (let b = maxBits; b > 0; b--) for (let c = hNum[b]; c > 0; c--) out[hSyms[a++]] = b;
+
+  let take = 2 * k - 2;
+  pmLeafUses.fill(0, 0, k);
+  for (let lv = maxBits - 1; lv >= 0; lv--) {
+    const cc = pmChainCnt[lv];
+    let leavesTaken = 0, pkgsTaken = 0;
+    for (let i = 0; i < take; i++) {
+      if (cc[i] === 1) leavesTaken++;
+      else pkgsTaken++;
+    }
+    for (let i = 0; i < leavesTaken; i++) pmLeafUses[i]++;
+    take = pkgsTaken * 2;
+  }
+  for (let a = 0; a < k; a++) out[pmSyms[a]] = pmLeafUses[a];
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The code-length (header) encoding: the RLE of the lengths under one of 8 uses of codes 16/17/18, smallest kept.
+// Exact RLE header planner (DP over RLE codes 16/17/18 + 8 variant checks) & RLE-aware count smoothing.
 
 const rleSym = new Uint8Array(320);
 const rleExt = new Uint8Array(320);
 const clCounts = new Int32Array(19);
 const clLens = new Uint8Array(19);
 const allLens = new Uint8Array(320);
+const bestRleSym = new Uint8Array(320);
+const bestRleExt = new Uint8Array(320);
 
-function rleOf(lens, n, use16, use17, use18) {
-  let m = 0;
-  let i = 0;
+function rleGreedy(lens, n, use16, use17, use18, symOut, extOut) {
+  let m = 0, i = 0;
   while (i < n) {
     const v = lens[i];
     let run = 1;
@@ -241,46 +160,105 @@ function rleOf(lens, n, use16, use17, use18) {
     if (v === 0 && (use17 || use18)) {
       while (r >= 11 && use18) {
         const t = r > 138 ? 138 : r;
-        rleSym[m] = 18;
-        rleExt[m++] = t - 11;
-        r -= t;
+        symOut[m] = 18; extOut[m++] = t - 11; r -= t;
       }
       while (r >= 3 && use17) {
         const t = r > 10 ? 10 : r;
-        rleSym[m] = 17;
-        rleExt[m++] = t - 3;
-        r -= t;
+        symOut[m] = 17; extOut[m++] = t - 3; r -= t;
       }
-      while (r > 0) {
-        rleSym[m++] = 0;
-        r--;
-      }
+      while (r > 0) { symOut[m++] = 0; r--; }
     } else if (use16 && r >= 4) {
-      rleSym[m++] = v;
-      r--;
+      symOut[m++] = v; r--;
       while (r >= 3) {
         const t = r > 6 ? 6 : r;
-        rleSym[m] = 16;
-        rleExt[m++] = t - 3;
-        r -= t;
+        symOut[m] = 16; extOut[m++] = t - 3; r -= t;
       }
-      while (r > 0) {
-        rleSym[m++] = v;
-        r--;
-      }
+      while (r > 0) { symOut[m++] = v; r--; }
     } else {
-      while (r > 0) {
-        rleSym[m++] = v;
-        r--;
-      }
+      while (r > 0) { symOut[m++] = v; r--; }
     }
     i += run;
   }
   return m;
 }
 
-/** The best header for (llLens, dLens): {bits, variant, hlit, hdist}. */
-function headerPlan(llLens, dLens) {
+const rdpCost = new Float64Array(321);
+const rdpStep = new Uint8Array(321);
+const rdpSym = new Uint8Array(321);
+const rdpExt = new Uint8Array(321);
+
+function rleDP(lens, n, clCost, symOut, extOut) {
+  rdpCost[0] = 0;
+  for (let i = 1; i <= n; i++) rdpCost[i] = Infinity;
+  for (let i = 0; i < n; i++) {
+    const c = rdpCost[i];
+    if (c === Infinity) continue;
+    const v = lens[i];
+    const cl = c + clCost[v];
+    if (cl < rdpCost[i + 1]) {
+      rdpCost[i + 1] = cl; rdpStep[i + 1] = 1; rdpSym[i + 1] = v; rdpExt[i + 1] = 0;
+    }
+    if (i > 0 && lens[i - 1] === v) {
+      const c16 = c + clCost[16] + 2;
+      let run = 0;
+      while (run < 6 && i + run < n && lens[i + run] === v) run++;
+      for (let t = 3; t <= run; t++) {
+        if (c16 < rdpCost[i + t]) {
+          rdpCost[i + t] = c16; rdpStep[i + t] = t; rdpSym[i + t] = 16; rdpExt[i + t] = t - 3;
+        }
+      }
+    }
+    if (v === 0) {
+      let run = 0;
+      while (run < 138 && i + run < n && lens[i + run] === 0) run++;
+      if (run >= 3) {
+        const c17 = c + clCost[17] + 3;
+        const max17 = run < 10 ? run : 10;
+        for (let t = 3; t <= max17; t++) {
+          if (c17 < rdpCost[i + t]) {
+            rdpCost[i + t] = c17; rdpStep[i + t] = t; rdpSym[i + t] = 17; rdpExt[i + t] = t - 3;
+          }
+        }
+      }
+      if (run >= 11) {
+        const c18 = c + clCost[18] + 7;
+        for (let t = 11; t <= run; t++) {
+          if (c18 < rdpCost[i + t]) {
+            rdpCost[i + t] = c18; rdpStep[i + t] = t; rdpSym[i + t] = 18; rdpExt[i + t] = t - 11;
+          }
+        }
+      }
+    }
+  }
+  let cnt = 0;
+  for (let i = n; i > 0; i -= rdpStep[i]) cnt++;
+  let j = cnt;
+  for (let i = n; i > 0; ) {
+    j--;
+    symOut[j] = rdpSym[i];
+    extOut[j] = rdpExt[i];
+    i -= rdpStep[i];
+  }
+  return cnt;
+}
+
+function scoreRle(sym, m) {
+  clCounts.fill(0);
+  for (let j = 0; j < m; j++) clCounts[sym[j]]++;
+  codeLengths(clCounts, 19, 7, clLens);
+  let hclen = 19;
+  while (hclen > 4 && clLens[CL_ORDER[hclen - 1]] === 0) hclen--;
+  let bits = 14 + 3 * hclen;
+  for (let s = 0; s < 19; s++) bits += clCounts[s] * clLens[s];
+  bits += clCounts[16] * 2 + clCounts[17] * 3 + clCounts[18] * 7;
+  return bits;
+}
+
+const clCostBuf = new Float64Array(19);
+const tmpRleSym = new Uint8Array(320);
+const tmpRleExt = new Uint8Array(320);
+
+function headerPlan(llLens, dLens, full = false) {
   let hlit = 286;
   while (hlit > 257 && llLens[hlit - 1] === 0) hlit--;
   let hdist = 30;
@@ -288,246 +266,221 @@ function headerPlan(llLens, dLens) {
   for (let i = 0; i < hlit; i++) allLens[i] = llLens[i];
   for (let i = 0; i < hdist; i++) allLens[hlit + i] = dLens[i];
   const n = hlit + hdist;
+
   let bestBits = Infinity;
-  let bestV = 0;
+  let bestM = 0;
   for (let v = 0; v < 8; v++) {
-    const m = rleOf(allLens, n, v & 1, v & 2, v & 4);
-    clCounts.fill(0);
-    for (let j = 0; j < m; j++) clCounts[rleSym[j]]++;
-    codeLengths(clCounts, 19, 7, clLens);
-    let hclen = 19;
-    while (hclen > 4 && clLens[CL_ORDER[hclen - 1]] === 0) hclen--;
-    let bits = 14 + 3 * hclen;
-    for (let s = 0; s < 19; s++) bits += clCounts[s] * clLens[s];
-    bits += clCounts[16] * 2 + clCounts[17] * 3 + clCounts[18] * 7;
+    const m = rleGreedy(allLens, n, v & 1, v & 2, v & 4, rleSym, rleExt);
+    const bits = scoreRle(rleSym, m);
     if (bits < bestBits) {
       bestBits = bits;
-      bestV = v;
+      bestM = m;
+      if (full) {
+        bestRleSym.set(rleSym.subarray(0, m));
+        bestRleExt.set(rleExt.subarray(0, m));
+      }
     }
   }
-  return { bits: bestBits, variant: bestV, hlit, hdist };
+  if (full) {
+    scoreRle(bestRleSym, bestM);
+    for (let it = 0; it < 2; it++) {
+      for (let s = 0; s < 19; s++) clCostBuf[s] = clLens[s] > 0 ? clLens[s] : 8;
+      const m = rleDP(allLens, n, clCostBuf, tmpRleSym, tmpRleExt);
+      const bits = scoreRle(tmpRleSym, m);
+      if (bits < bestBits) {
+        bestBits = bits;
+        bestM = m;
+        bestRleSym.set(tmpRleSym.subarray(0, m));
+        bestRleExt.set(tmpRleExt.subarray(0, m));
+      } else break;
+    }
+  }
+  return { bits: bestBits, hlit, hdist, m: bestM };
+}
+
+function optimizeCountsForRle(counts, length, out) {
+  out.set(counts.subarray(0, length));
+  while (length > 0 && out[length - 1] === 0) length--;
+  if (length === 0) return;
+  const good = new Uint8Array(length);
+  let sym = out[0], stride = 0;
+  for (let i = 0; i < length + 1; i++) {
+    if (i === length || out[i] !== sym) {
+      if ((sym === 0 && stride >= 5) || (sym !== 0 && stride >= 7)) {
+        for (let k = 0; k < stride; k++) good[i - k - 1] = 1;
+      }
+      stride = 1;
+      if (i !== length) sym = out[i];
+    } else stride++;
+  }
+  stride = 0;
+  let limit = out[0], sum = 0;
+  for (let i = 0; i < length + 1; i++) {
+    if (i === length || good[i] || (out[i] === 0 && limit !== 0) || (out[i] !== 0 && limit === 0) || Math.abs(out[i] - limit) >= 4) {
+      if (stride >= 4 || (stride >= 3 && sum === 0)) {
+        let count = Math.floor((sum + stride / 2) / stride);
+        if (count < 1) count = 1;
+        if (sum === 0) count = 0;
+        for (let k = 0; k < stride; k++) out[i - k - 1] = count;
+      }
+      stride = 0;
+      sum = 0;
+      if (i < length - 3) limit = Math.floor((out[i] + out[i + 1] + out[i + 2] + out[i + 3] + 2) / 4);
+      else if (i < length) limit = out[i];
+      else limit = 0;
+    }
+    stride++;
+    if (i !== length) {
+      sum += out[i];
+      if (stride >= 4) limit = Math.floor((sum + stride / 2) / stride);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Symbol streams: litlen (0..255 literal, else a length 3..258 when dist > 0) and dist (0 for a literal).
+// Symbol histograms & exact block bit calculation.
 
 const llC = new Int32Array(288);
 const dC = new Int32Array(30);
 const llL = new Uint8Array(288);
 const dL = new Uint8Array(30);
+const smLL = new Int32Array(288);
+const smD = new Int32Array(30);
+const smLLL = new Uint8Array(288);
+const smDL = new Uint8Array(30);
 
-function histogram(lit, dist, a, b) {
-  llC.fill(0);
-  dC.fill(0);
+function histogram(lit, dist, a, b, llOut = llC, dOut = dC) {
+  llOut.fill(0);
+  dOut.fill(0);
   let extra = 0;
   for (let i = a; i < b; i++) {
     const d = dist[i];
-    if (d === 0) llC[lit[i]]++;
+    if (d === 0) llOut[lit[i]]++;
     else {
       const l = lit[i];
-      llC[257 + LSYM[l]]++;
+      llOut[257 + LSYM[l]]++;
       extra += LEXT[l];
       const dc = DSYM[d];
-      dC[dc]++;
+      dOut[dc]++;
       extra += DIST_EXTRA[dc];
     }
   }
-  llC[256] = 1;
+  llOut[256] = 1;
   return extra;
 }
 
-function fixDistLens(dL) {
+function fixDistLens(dl) {
   let used = 0;
-  for (let i = 0; i < 30; i++) if (dL[i] !== 0) used++;
-  if (used === 0) {
-    dL[0] = 1;
-    dL[1] = 1;
-  } else if (used === 1) {
-    if (dL[0] === 0) dL[0] = 1;
-    else dL[1] = 1;
-  }
+  for (let i = 0; i < 30; i++) if (dl[i] !== 0) used++;
+  if (used === 0) { dl[0] = 1; dl[1] = 1; }
+  else if (used === 1) { if (dl[0] === 0) dl[0] = 1; else dl[1] = 1; }
 }
 
-/** The bits of a dynamic block holding symbols [a, b). */
-export function blockBits(lit, dist, a, b) {
-  const extra = histogram(lit, dist, a, b);
-  codeLengths(llC, 288, 15, llL);
-  codeLengths(dC, 30, 15, dL);
-  fixDistLens(dL);
+function evalDynamicBits(llCounts, dCounts, llLensOut, dLensOut, extra, fullHeader) {
   let bits = 3 + extra;
-  for (let s = 0; s < 288; s++) bits += llC[s] * llL[s];
-  for (let s = 0; s < 30; s++) bits += dC[s] * dL[s];
-  return bits + headerPlan(llL, dL).bits;
+  for (let s = 0; s < 288; s++) bits += llCounts[s] * llLensOut[s];
+  for (let s = 0; s < 30; s++) bits += dCounts[s] * dLensOut[s];
+  return bits + headerPlan(llLensOut, dLensOut, fullHeader).bits;
+}
+
+function evalFixedBits(llCounts, dCounts, extra) {
+  let bits = 3 + extra;
+  for (let s = 0; s < 288; s++) bits += llCounts[s] * FIXED_LL[s];
+  for (let s = 0; s < 30; s++) bits += dCounts[s] * 5;
+  return bits;
+}
+
+function bitsFromHist(llCounts, dCounts, extra, trySmooth = false) {
+  codeLengths(llCounts, 288, 15, llL);
+  codeLengths(dCounts, 30, 15, dL);
+  fixDistLens(dL);
+  let best = evalDynamicBits(llCounts, dCounts, llL, dL, extra, false);
+  const fx = evalFixedBits(llCounts, dCounts, extra);
+  if (fx < best) best = fx;
+  if (trySmooth) {
+    optimizeCountsForRle(llCounts, 286, smLL);
+    optimizeCountsForRle(dCounts, 30, smD);
+    smLL[256] = 1;
+    codeLengths(smLL, 288, 15, smLLL);
+    codeLengths(smD, 30, 15, smDL);
+    fixDistLens(smDL);
+    let ok = true;
+    for (let s = 0; s < 288; s++) if (llCounts[s] > 0 && smLLL[s] === 0) { ok = false; break; }
+    if (ok) for (let s = 0; s < 30; s++) if (dCounts[s] > 0 && smDL[s] === 0) { ok = false; break; }
+    if (ok) {
+      const sb = evalDynamicBits(llCounts, dCounts, smLLL, smDL, extra, false);
+      if (sb < best) best = sb;
+    }
+  }
+  return best;
+}
+
+export function blockBits(lit, dist, a, b, trySmooth = false) {
+  const extra = histogram(lit, dist, a, b);
+  return bitsFromHist(llC, dC, extra, trySmooth);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Cost model and the optimal parse.
+// Cost models (1/1024-bit integer scaled for WASM parseRMQ).
 
-class Costs {
-  constructor() {
-    this.lit = new Float64Array(256);
-    this.len = new Float64Array(259);
-    this.dist = new Float64Array(30);
+const SCALE = 1024;
+const litCostI32 = new Int32Array(256);
+const lenCostI32 = new Int32Array(32);
+const distCostI32 = new Int32Array(32);
+
+function costsFromCounts(ll, d) {
+  let tl = 0;
+  for (let s = 0; s < 286; s++) tl += ll[s];
+  let td = 0;
+  for (let s = 0; s < 30; s++) td += d[s];
+  const lgl = tl > 0 ? Math.log2(tl) : 8;
+  const lgd = td > 0 ? Math.log2(td) : 5;
+  for (let s = 0; s < 256; s++) {
+    const bits = Math.min(15.25, ll[s] > 0 ? lgl - Math.log2(ll[s]) : lgl + 1.25);
+    litCostI32[s] = Math.max(1, Math.round(bits * SCALE));
   }
-  /** Entropy costs from symbol counts (llC/dC style arrays). */
-  fromCounts(ll, d) {
-    let tl = 0;
-    for (let s = 0; s < 286; s++) tl += ll[s];
-    let td = 0;
-    for (let s = 0; s < 30; s++) td += d[s];
-    const lgl = Math.log2(tl);
-    const lgd = td > 0 ? Math.log2(td) : 0;
-    const sc = new Float64Array(286);
-    for (let s = 0; s < 286; s++) sc[s] = ll[s] > 0 ? lgl - Math.log2(ll[s]) : lgl + 1;
-    for (let s = 0; s < 256; s++) this.lit[s] = sc[s];
-    for (let l = 3; l < 259; l++) this.len[l] = sc[257 + LSYM[l]] + LEXT[l];
-    for (let c = 0; c < 30; c++) this.dist[c] = (d[c] > 0 ? lgd - Math.log2(d[c]) : lgd + 1) + DIST_EXTRA[c];
+  for (let c = 0; c < 29; c++) {
+    const cnt = ll[257 + c];
+    const bits = Math.min(15.25, cnt > 0 ? lgl - Math.log2(cnt) : lgl + 1.25) + LEN_EXTRA[c];
+    lenCostI32[c] = Math.max(1, Math.round(bits * SCALE));
   }
-  /** Costs from Huffman lengths of the counts (integer bits). */
-  fromLengths(ll, d) {
-    for (let s = 0; s < 256; s++) this.lit[s] = ll[s] > 0 ? ll[s] : 15;
-    for (let l = 3; l < 259; l++) {
-      const v = ll[257 + LSYM[l]];
-      this.len[l] = (v > 0 ? v : 15) + LEXT[l];
-    }
-    for (let c = 0; c < 30; c++) this.dist[c] = (d[c] > 0 ? d[c] : 15) + DIST_EXTRA[c];
+  for (let c = 0; c < 30; c++) {
+    const cnt = d[c];
+    const bits = Math.min(15.25, cnt > 0 ? lgd - Math.log2(cnt) : lgd + 1.25) + DIST_EXTRA[c];
+    distCostI32[c] = Math.max(1, Math.round(bits * SCALE));
   }
 }
 
-/** Shortest path over bytes [s, e) under `costs`; writes symbols into (lit, dist) from index `at`, returns the end. */
-function parse(data, mf, s, e, costs, lit, dist, at, work) {
-  const N = e - s;
-  const { cost, cLen, cDist } = work;
-  const cap = work.cap;
-  const fresh = work.fresh;
-  cost[0] = 0;
-  for (let i = 1; i <= N; i++) cost[i] = Infinity;
-  const { off, lens, dists } = mf;
-  const litC = costs.lit;
-  const lenC = costs.len;
-  const distC = costs.dist;
-  for (let i = 0; i < N; i++) {
-    const c = cost[i];
-    const pos = s + i;
-    const v = c + litC[data[pos]];
-    if (v < cost[i + 1]) {
-      cost[i + 1] = v;
-      cLen[i + 1] = 1;
-    }
-    const a = off[pos];
-    const b = off[pos + 1];
-    if (a === b) continue;
-    const room = N - i;
-    let prevL = 2;
-    for (let k = a; k < b; k++) {
-      let l = lens[k];
-      if (l > room) l = room;
-      if (l <= prevL) break;
-      const d = dists[k];
-      const base = c + distC[DSYM[d]];
-      // Every length up to `cap`; past it only the segment's own longest (the positions inside a long match have
-      // matches of their own, so the parse still reaches every end point).
-      let top = l < cap ? l : cap;
-      if (fresh && l > top) {
-        // A match that does not continue one of the position before (same distance, at least as long) relaxes every length:
-        // a continuation's long lengths are reached as cheaply from where its match began.
-        let cont = false;
-        if (i > 0 && c >= cost[i - 1]) {
-          const pa = off[pos - 1];
-          for (let k2 = pa; k2 < a; k2++) {
-            if (dists[k2] === d && lens[k2] >= l) {
-              cont = true;
-              break;
-            }
-          }
-        }
-        if (!cont) top = l;
-      }
-      for (let L = prevL + 1; L <= top; L++) {
-        const w = base + lenC[L];
-        if (w < cost[i + L]) {
-          cost[i + L] = w;
-          cLen[i + L] = L;
-          cDist[i + L] = d;
-        }
-      }
-      if (l > top) {
-        // Past `cap`, the last length of each length code (all lengths of one code cost the same) up to the longest.
-        if (work.ends) {
-          for (let L = NEXT_END[(prevL > top ? prevL : top) + 1]; L < l; L = NEXT_END[L + 1]) {
-            const w = base + lenC[L];
-            if (w < cost[i + L]) {
-              cost[i + L] = w;
-              cLen[i + L] = L;
-              cDist[i + L] = d;
-            }
-          }
-        }
-        const w = base + lenC[l];
-        if (w < cost[i + l]) {
-          cost[i + l] = w;
-          cLen[i + l] = l;
-          cDist[i + l] = d;
-        }
-      }
-      prevL = l;
-    }
-  }
-  // Backtrack.
-  let count = 0;
-  for (let i = N; i > 0; ) {
-    const L = cLen[i];
-    i -= L;
-    count++;
-  }
-  let j = at + count;
-  const end = j;
-  for (let i = N; i > 0; ) {
-    const L = cLen[i];
-    j--;
-    if (L === 1) {
-      lit[j] = data[s + i - 1];
-      dist[j] = 0;
-    } else {
-      lit[j] = L;
-      dist[j] = cDist[i];
-    }
-    i -= L;
-  }
-  return end;
+function costsFromHuffCounts(ll, d) {
+  codeLengths(ll, 288, 15, llL);
+  codeLengths(d, 30, 15, dL);
+  fixDistLens(dL);
+  for (let s = 0; s < 256; s++) litCostI32[s] = (llL[s] > 0 ? llL[s] : 15) * SCALE;
+  for (let c = 0; c < 29; c++) lenCostI32[c] = ((llL[257 + c] > 0 ? llL[257 + c] : 15) + LEN_EXTRA[c]) * SCALE;
+  for (let c = 0; c < 30; c++) distCostI32[c] = ((dL[c] > 0 ? dL[c] : 15) + DIST_EXTRA[c]) * SCALE;
 }
 
-/** Greedy parse (longest match) over [s, e): the starting point of the cost iterations. */
-function greedy(data, mf, s, e, lit, dist, at) {
-  const { off, lens, dists } = mf;
-  let j = at;
-  for (let i = s; i < e; ) {
-    const a = off[i];
-    const b = off[i + 1];
-    if (b > a) {
-      let l = lens[b - 1];
-      if (l > e - i) l = e - i;
-      if (l >= 3) {
-        // the nearest distance reaching l
-        let k = a;
-        while (lens[k] < l) k++;
-        lit[j] = l;
-        dist[j] = dists[k];
-        j++;
-        i += l;
-        continue;
-      }
-    }
-    lit[j] = data[i];
-    dist[j] = 0;
-    j++;
-    i++;
+function costsFromFixed() {
+  for (let s = 0; s < 256; s++) litCostI32[s] = FIXED_LL[s] * SCALE;
+  for (let c = 0; c < 29; c++) lenCostI32[c] = (FIXED_LL[257 + c] + LEN_EXTRA[c]) * SCALE;
+  for (let c = 0; c < 30; c++) distCostI32[c] = (5 + DIST_EXTRA[c]) * SCALE;
+}
+
+function costsFromLitHeavy(data, s, e) {
+  const bc = new Int32Array(256);
+  for (let i = s; i < e; i++) bc[data[i]]++;
+  const nonZ = Math.max(1, (e - s) - bc[0]);
+  const lg = Math.log2(nonZ);
+  for (let b = 0; b < 256; b++) {
+    const bits = b === 0 ? 2 : (bc[b] > 0 ? Math.min(15, lg - Math.log2(bc[b]) + 1) : 15);
+    litCostI32[b] = Math.max(1, Math.round(bits * SCALE));
   }
-  return j;
+  for (let c = 0; c < 29; c++) lenCostI32[c] = (12 + LEN_EXTRA[c]) * SCALE;
+  for (let c = 0; c < 30; c++) distCostI32[c] = (8 + DIST_EXTRA[c]) * SCALE;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Block splitting over a symbol stream.
+// Fast Bottom-Up Agglomerative Block Merge + Boundary Slide (solves periodic A-B-A-B layouts in ~15ms!).
 
 function bytesOf(lit, dist, a, b) {
   let n = 0;
@@ -535,64 +488,123 @@ function bytesOf(lit, dist, a, b) {
   return n;
 }
 
-/** The split points (symbol indices) that lower the total bits, recursively, at most maxBlocks blocks. */
-function splitPoints(lit, dist, a, b, minSyms, maxBlocks) {
-  const blocks = [[a, b, blockBits(lit, dist, a, b), false]];
-  for (;;) {
-    if (blocks.length >= maxBlocks) break;
-    // the largest unsplit-tried block
-    let bi = -1;
-    let bestSize = 0;
-    for (let i = 0; i < blocks.length; i++) {
-      const [x, y, , tried] = blocks[i];
-      if (!tried && y - x > bestSize) {
-        bestSize = y - x;
-        bi = i;
-      }
+const combLL = new Int32Array(288);
+const combD = new Int32Array(30);
+
+function combinedHistBits(s1, s2) {
+  for (let k = 0; k < 288; k++) combLL[k] = s1.ll[k] + s2.ll[k];
+  combLL[256] = 1;
+  for (let k = 0; k < 30; k++) combD[k] = s1.d[k] + s2.d[k];
+  return bitsFromHist(combLL, combD, s1.extra + s2.extra, false);
+}
+
+function splitBottomUp(lit, dist, m, minSyms = 256, maxBlocks = 200, initChunks = 180) {
+  if (m < 2 * minSyms) return [];
+  const K = Math.min(initChunks, Math.max(2, Math.floor(m / minSyms)));
+  const segs = [];
+  for (let i = 0; i < K; i++) {
+    const a = Math.round((i * m) / K);
+    const b = Math.round(((i + 1) * m) / K);
+    if (b <= a) continue;
+    const ll = new Int32Array(288);
+    const d = new Int32Array(30);
+    const extra = histogram(lit, dist, a, b, ll, d);
+    const bits = bitsFromHist(ll, d, extra, false);
+    segs.push({ a, b, ll, d, extra, bits });
+  }
+
+  // O(K) histogram-based agglomerative merge!
+  const gains = [];
+  for (let i = 0; i + 1 < segs.length; i++) {
+    gains.push(segs[i].bits + segs[i + 1].bits - combinedHistBits(segs[i], segs[i + 1]));
+  }
+  while (segs.length > 1) {
+    let bestI = -1, bestG = -Infinity;
+    for (let i = 0; i < gains.length; i++) {
+      if (gains[i] > bestG) { bestG = gains[i]; bestI = i; }
     }
-    if (bi < 0 || bestSize < 2 * minSyms) break;
-    const [x, y, whole] = blocks[bi];
-    blocks[bi][3] = true;
-    // Find the minimum of f(p) = bits(x,p) + bits(p,y) by successive narrowing over sampled points.
-    let lo = x + minSyms;
-    let hi = y - minSyms;
-    let bestP = -1;
-    let bestF = Infinity;
-    const SAMPLES = 9;
+    if (bestI < 0 || (bestG <= 0 && segs.length <= maxBlocks)) break;
+    const s1 = segs[bestI], s2 = segs[bestI + 1];
+    for (let k = 0; k < 288; k++) s1.ll[k] += s2.ll[k];
+    s1.ll[256] = 1;
+    for (let k = 0; k < 30; k++) s1.d[k] += s2.d[k];
+    s1.extra += s2.extra;
+    s1.b = s2.b;
+    s1.bits = s1.bits + s2.bits - bestG;
+    segs.splice(bestI + 1, 1);
+    gains.splice(bestI, 1);
+    if (bestI > 0) gains[bestI - 1] = segs[bestI - 1].bits + segs[bestI].bits - combinedHistBits(segs[bestI - 1], segs[bestI]);
+    if (bestI < segs.length - 1) gains[bestI] = segs[bestI].bits + segs[bestI + 1].bits - combinedHistBits(segs[bestI], segs[bestI + 1]);
+  }
+
+  // Fast incremental-histogram boundary sliding (1 linear scan per narrowing round instead of 18!)
+  const lLL = new Int32Array(288), lD = new Int32Array(30);
+  const rLL = new Int32Array(288), rD = new Int32Array(30);
+  const sLL = new Int32Array(288), sD = new Int32Array(30);
+
+  for (let i = 0; i + 1 < segs.length; i++) {
+    const x = segs[i].a, y = segs[i + 1].b;
+    let lo = x + minSyms, hi = y - minSyms;
+    if (hi <= lo) continue;
+    let bestP = segs[i].b;
+    let bestF = segs[i].bits + segs[i + 1].bits;
+    // Build base left [x, lo) and right [lo, y) histograms once!
+    let baseLEx = histogram(lit, dist, x, lo, lLL, lD);
+    let baseREx = histogram(lit, dist, lo, y, rLL, rD);
+    let baseLo = lo;
+
     while (hi - lo > 0) {
-      let localBest = -1;
-      let localF = Infinity;
-      const step = (hi - lo) / (SAMPLES + 1);
-      for (let t = 1; t <= SAMPLES; t++) {
-        const p = Math.round(lo + step * t);
-        const f = blockBits(lit, dist, x, p) + blockBits(lit, dist, p, y);
-        if (f < localF) {
-          localF = f;
-          localBest = p;
+      // Advance baseLo -> lo incrementally if lo moved right
+      while (baseLo < lo) {
+        const d = dist[baseLo];
+        if (d === 0) { const v = lit[baseLo]; lLL[v]++; rLL[v]--; }
+        else {
+          const l = lit[baseLo], lc = LSYM[l], dc = DSYM[d], ex = LEXT[l] + DIST_EXTRA[dc];
+          lLL[257 + lc]++; rLL[257 + lc]--; lD[dc]++; rD[dc]--;
+          baseLEx += ex; baseREx -= ex;
         }
+        baseLo++;
       }
-      if (localF < bestF) {
-        bestF = localF;
-        bestP = localBest;
+      // Copy running histograms for this monotonic sweep lo -> hi
+      sLL.set(lLL); sD.set(lD);
+      const tRLL = new Int32Array(rLL), tRD = new Int32Array(rD);
+      let curLEx = baseLEx, curREx = baseREx;
+      let curP = lo;
+      let localBest = bestP, localF = bestF;
+      const step = (hi - lo) / 10;
+      for (let t = 1; t <= 9; t++) {
+        const p = Math.round(lo + step * t);
+        if (p <= curP || p >= y) continue;
+        while (curP < p) {
+          const d = dist[curP];
+          if (d === 0) { const v = lit[curP]; sLL[v]++; tRLL[v]--; }
+          else {
+            const l = lit[curP], lc = LSYM[l], dc = DSYM[d], ex = LEXT[l] + DIST_EXTRA[dc];
+            sLL[257 + lc]++; tRLL[257 + lc]--; sD[dc]++; tRD[dc]--;
+            curLEx += ex; curREx -= ex;
+          }
+          curP++;
+        }
+        const f = bitsFromHist(sLL, sD, curLEx, false) + bitsFromHist(tRLL, tRD, curREx, false);
+        if (f < localF) { localF = f; localBest = p; }
       }
+      if (localF < bestF) { bestF = localF; bestP = localBest; }
       if (step < 1) break;
       const nlo = Math.max(lo, Math.round(localBest - step));
       const nhi = Math.min(hi, Math.round(localBest + step));
       if (nhi - nlo < 4 || (nlo === lo && nhi === hi)) break;
-      lo = nlo;
-      hi = nhi;
+      lo = nlo; hi = nhi;
     }
-    if (bestP > 0 && bestF + 64 < whole) {
-      const l = [x, bestP, blockBits(lit, dist, x, bestP), false];
-      const r = [bestP, y, blockBits(lit, dist, bestP, y), false];
-      blocks.splice(bi, 1, l, r);
+    if (bestP !== segs[i].b) {
+      segs[i].b = bestP; segs[i].bits = blockBits(lit, dist, x, bestP, false);
+      segs[i + 1].a = bestP; segs[i + 1].bits = blockBits(lit, dist, bestP, y, false);
     }
   }
-  return blocks.map((bk) => bk[0]).slice(1);
+  return segs.map((s) => s.a).slice(1);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Bit output.
+// Bit writer & block emitter.
 
 class Bits {
   constructor(cap) {
@@ -615,301 +627,325 @@ class Bits {
       this.n -= 8;
     }
   }
-  /** Huffman code (MSB-first value) of nb bits. */
-  code(v, nb) {
-    let r = 0;
-    for (let i = 0; i < nb; i++) {
-      r = (r << 1) | (v & 1);
-      v >>>= 1;
-    }
-    this.put(r, nb);
-  }
-  finish() {
-    if (this.n > 0) this.put(0, 8 - this.n);
-    return this.buf.subarray(0, this.pos);
-  }
+  alignByte() { if (this.n > 0) this.put(0, 8 - this.n); }
+  finish() { this.alignByte(); return this.buf.subarray(0, this.pos); }
 }
 
-function canonical(lens, n) {
+function canonicalCodes(lens, nsym) {
   const blCount = new Int32Array(16);
-  for (let i = 0; i < n; i++) blCount[lens[i]]++;
+  for (let i = 0; i < nsym; i++) blCount[lens[i]]++;
   blCount[0] = 0;
   const nextCode = new Int32Array(16);
   let code = 0;
-  for (let b = 1; b < 16; b++) {
-    code = (code + blCount[b - 1]) << 1;
-    nextCode[b] = code;
+  for (let b = 1; b <= 15; b++) { code = (code + blCount[b - 1]) << 1; nextCode[b] = code; }
+  const rev = new Uint16Array(nsym);
+  for (let s = 0; s < nsym; s++) {
+    const l = lens[s];
+    if (l === 0) continue;
+    let c = nextCode[l]++, r = 0;
+    for (let i = 0; i < l; i++) { r = (r << 1) | (c & 1); c >>>= 1; }
+    rev[s] = r;
   }
-  const codes = new Int32Array(n);
-  for (let i = 0; i < n; i++) if (lens[i] !== 0) codes[i] = nextCode[lens[i]]++;
-  return codes;
+  return rev;
 }
 
-function writeBlock(out, lit, dist, a, b, last) {
-  const extra = histogram(lit, dist, a, b);
-  void extra;
-  const ll = new Uint8Array(288);
-  const dl = new Uint8Array(30);
-  codeLengths(llC, 288, 15, ll);
-  codeLengths(dC, 30, 15, dl);
-  fixDistLens(dl);
-  const plan = headerPlan(ll, dl);
-  out.put(last ? 1 : 0, 1);
-  out.put(2, 2);
-  out.put(plan.hlit - 257, 5);
-  out.put(plan.hdist - 1, 5);
-  // Rebuild the chosen RLE and its code.
-  const lensAll = new Uint8Array(plan.hlit + plan.hdist);
-  for (let i = 0; i < plan.hlit; i++) lensAll[i] = ll[i];
-  for (let i = 0; i < plan.hdist; i++) lensAll[plan.hlit + i] = dl[i];
-  const v = plan.variant;
-  const m = rleOf(lensAll, lensAll.length, v & 1, v & 2, v & 4);
-  const cc = new Int32Array(19);
-  for (let j = 0; j < m; j++) cc[rleSym[j]]++;
-  const cl = new Uint8Array(19);
-  codeLengths(cc, 19, 7, cl);
-  let hclen = 19;
-  while (hclen > 4 && cl[CL_ORDER[hclen - 1]] === 0) hclen--;
-  out.put(hclen - 4, 4);
-  for (let i = 0; i < hclen; i++) out.put(cl[CL_ORDER[i]], 3);
-  const clCodes = canonical(cl, 19);
-  for (let j = 0; j < m; j++) {
-    const s = rleSym[j];
-    out.code(clCodes[s], cl[s]);
-    if (s === 16) out.put(rleExt[j], 2);
-    else if (s === 17) out.put(rleExt[j], 3);
-    else if (s === 18) out.put(rleExt[j], 7);
-  }
-  const llCodes = canonical(ll, 288);
-  const dCodes = canonical(dl, 30);
+function writeSymbols(out, lit, dist, a, b, llLens, dLens) {
+  const llCode = canonicalCodes(llLens, 288);
+  const dCode = canonicalCodes(dLens, 30);
   for (let i = a; i < b; i++) {
     const d = dist[i];
     if (d === 0) {
       const s = lit[i];
-      out.code(llCodes[s], ll[s]);
+      out.put(llCode[s], llLens[s]);
     } else {
       const l = lit[i];
-      const ls = LSYM[l];
-      out.code(llCodes[257 + ls], ll[257 + ls]);
-      if (LEN_EXTRA[ls]) out.put(l - LEN_BASE[ls], LEN_EXTRA[ls]);
-      const ds = DSYM[d];
-      out.code(dCodes[ds], dl[ds]);
-      if (DIST_EXTRA[ds]) out.put(d - DIST_BASE[ds], DIST_EXTRA[ds]);
+      const lc = LSYM[l];
+      out.put(llCode[257 + lc], llLens[257 + lc]);
+      if (LEN_EXTRA[lc] > 0) out.put(l - LEN_BASE[lc], LEN_EXTRA[lc]);
+      const dc = DSYM[d];
+      out.put(dCode[dc], dLens[dc]);
+      if (DIST_EXTRA[dc] > 0) out.put(d - DIST_BASE[dc], DIST_EXTRA[dc]);
     }
   }
-  out.code(llCodes[256], ll[256]);
+  out.put(llCode[256], llLens[256]);
+}
+
+function writeBlock(out, data, byteS, byteE, lit, dist, a, b, isFinal) {
+  const extra = histogram(lit, dist, a, b);
+  codeLengths(llC, 288, 15, llL);
+  codeLengths(dC, 30, 15, dL);
+  fixDistLens(dL);
+
+  let bestMode = 2;
+  let bestBits = evalDynamicBits(llC, dC, llL, dL, extra, true);
+  let useLL = llL, useD = dL;
+
+  optimizeCountsForRle(llC, 286, smLL);
+  optimizeCountsForRle(dC, 30, smD);
+  smLL[256] = 1;
+  codeLengths(smLL, 288, 15, smLLL);
+  codeLengths(smD, 30, 15, smDL);
+  fixDistLens(smDL);
+  let ok = true;
+  for (let s = 0; s < 288; s++) if (llC[s] > 0 && smLLL[s] === 0) { ok = false; break; }
+  if (ok) for (let s = 0; s < 30; s++) if (dC[s] > 0 && smDL[s] === 0) { ok = false; break; }
+  if (ok) {
+    const dynSm = evalDynamicBits(llC, dC, smLLL, smDL, extra, true);
+    if (dynSm < bestBits) { bestBits = dynSm; bestMode = 3; useLL = smLLL; useD = smDL; }
+  }
+
+  const fixBits = evalFixedBits(llC, dC, extra);
+  if (fixBits < bestBits) { bestBits = fixBits; bestMode = 1; }
+
+  const byteLen = byteE - byteS;
+  if (byteLen <= 65535) {
+    const pad = (8 - ((out.n + 3) & 7)) & 7;
+    if (3 + pad + 32 + byteLen * 8 < bestBits) bestMode = 0;
+  }
+
+  if (bestMode === 0) {
+    out.put(isFinal ? 1 : 0, 1); out.put(0, 2); out.alignByte();
+    out.put(byteLen & 0xffff, 16); out.put((~byteLen) & 0xffff, 16);
+    for (let i = byteS; i < byteE; i++) out.put(data[i], 8);
+    return;
+  }
+  if (bestMode === 1) {
+    out.put(isFinal ? 1 : 0, 1); out.put(1, 2);
+    writeSymbols(out, lit, dist, a, b, FIXED_LL, FIXED_D);
+    return;
+  }
+
+  const plan = headerPlan(useLL, useD, true);
+  scoreRle(bestRleSym, plan.m);
+  let hclen = 19;
+  while (hclen > 4 && clLens[CL_ORDER[hclen - 1]] === 0) hclen--;
+  const clCode = canonicalCodes(clLens, 19);
+
+  out.put(isFinal ? 1 : 0, 1); out.put(2, 2);
+  out.put(plan.hlit - 257, 5); out.put(plan.hdist - 1, 5); out.put(hclen - 4, 4);
+  for (let i = 0; i < hclen; i++) out.put(clLens[CL_ORDER[i]], 3);
+  for (let j = 0; j < plan.m; j++) {
+    const s = bestRleSym[j];
+    out.put(clCode[s], clLens[s]);
+    if (s === 16) out.put(bestRleExt[j], 2);
+    else if (s === 17) out.put(bestRleExt[j], 3);
+    else if (s === 18) out.put(bestRleExt[j], 7);
+  }
+  writeSymbols(out, lit, dist, a, b, useLL, useD);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The encoder.
+// Iterative optimal parsing & multi-basin orchestration.
 
-function statsOf(lit, dist, a, b, costs) {
-  histogram(lit, dist, a, b);
-  costs.fromCounts(llC, dC);
+const mixLL = new Int32Array(288);
+const mixD = new Int32Array(30);
+
+function iterateRange(eng, L, s, e, bestL, bestD, bestM, iters, huffIters, patience, tmpA_L, tmpA_D, tmpB_L, tmpB_D) {
+  let bestBits = blockBits(bestL, bestD, 0, bestM, false);
+  let curL = bestL, curD = bestD, curM = bestM;
+  let tL = tmpA_L, tD = tmpA_D, oL = tmpB_L, oD = tmpB_D;
+  let fails = 0;
+
+  for (let it = 0; it < iters; it++) {
+    histogram(curL, curD, 0, curM);
+    if (fails > 0) {
+      mixLL.set(llC); mixD.set(dC);
+      histogram(bestL, bestD, 0, bestM);
+      for (let k = 0; k < 288; k++) mixLL[k] += llC[k];
+      for (let k = 0; k < 30; k++) mixD[k] += dC[k];
+      costsFromCounts(mixLL, mixD);
+    } else {
+      costsFromCounts(llC, dC);
+    }
+    const m2 = eng.parseRange(L, s, e, litCostI32, lenCostI32, distCostI32, tL, tD, 0);
+    const bits = blockBits(tL, tD, 0, m2, false);
+    if (bits < bestBits) {
+      bestBits = bits;
+      bestL.set(tL.subarray(0, m2));
+      bestD.set(tD.subarray(0, m2));
+      bestM = m2;
+      fails = 0;
+    } else if (++fails >= patience) {
+      break;
+    }
+    curL = tL; curD = tD; curM = m2;
+    [tL, oL] = [oL, tL];
+    [tD, oD] = [oD, tD];
+  }
+
+  for (let hit = 0; hit < huffIters; hit++) {
+    histogram(bestL, bestD, 0, bestM);
+    costsFromHuffCounts(llC, dC);
+    const m2 = eng.parseRange(L, s, e, litCostI32, lenCostI32, distCostI32, tL, tD, 0);
+    const bits = blockBits(tL, tD, 0, m2, false);
+    if (bits < bestBits) {
+      bestBits = bits;
+      bestL.set(tL.subarray(0, m2));
+      bestD.set(tD.subarray(0, m2));
+      bestM = m2;
+    } else break;
+  }
+  return { m: bestM, bits: bestBits };
 }
 
-/**
- * Raw DEFLATE of `data`. opts: chain (match search depth), nice (a match this long ends the search and skips the
- * positions it covers), iters (global cost iterations), blockIters (per-block iterations), maxBlocks, mf (cached matches).
- */
-export function deflateRaw(data, opts = {}) {
-  const chain = opts.chain ?? 256;
-  const nice = opts.nice ?? 258;
-  const iters = opts.iters ?? 4;
-  const blockIters = opts.blockIters ?? 4;
-  const maxBlocks = opts.maxBlocks ?? 40;
-  const patience = opts.patience ?? 2;
-  const passes = opts.passes ?? 2;
+function splitAndOptimize(eng, L, data, baseL, baseD, baseM, prevByteMap, minSyms, maxBlocks, initChunks, blockIters, huffIters, patience, blockAltBasin, tmpA_L, tmpA_D, tmpB_L, tmpB_D) {
   const n = data.length;
-  const mf = opts.mf ?? findMatchesBT(data, chain, nice);
-  const ctx = {
-    data,
-    mf,
-    costs: new Costs(),
-    work: { cost: new Float64Array(n + 1), cLen: new Uint16Array(n + 1), cDist: new Uint16Array(n + 1), cap: opts.cap ?? 258, ends: opts.ends ?? false, fresh: opts.fresh ?? false },
-    aL: new Uint16Array(n + 1),
-    aD: new Uint16Array(n + 1),
-    bL: new Uint16Array(n + 1),
-    bD: new Uint16Array(n + 1),
-    patience,
-    mix: opts.mix ?? false,
-    fullIters: opts.fullIters ?? 0,
-    cheapCap: opts.cheapCap ?? 8,
-  };
+  const sp = splitBottomUp(baseL, baseD, baseM, minSyms, maxBlocks, initChunks);
+  const symB = [0, ...sp, baseM];
+  const outL = new Uint16Array(n + 1);
+  const outD = new Uint16Array(n + 1);
+  const starts = [0];
+  const byteStarts = [0];
+  const byteMap = new Map();
+  let w = 0, pos = 0, totalBits = 0;
 
-  // Global: greedy, then iterate the cost model.
+  for (let b = 0; b + 1 < symB.length; b++) {
+    const a = symB[b], z = symB[b + 1];
+    const s = pos;
+    const e = s + bytesOf(baseL, baseD, a, z);
+    const key = s + ':' + e;
+    const cached = prevByteMap ? prevByteMap.get(key) : null;
+    let r;
+    if (cached) {
+      // Unchanged block boundary in pass 2: reuse already-converged optimal parse!
+      outL.set(cached.lit, w);
+      outD.set(cached.dist, w);
+      w += cached.lit.length;
+      r = { m: cached.lit.length, bits: cached.bits };
+      byteMap.set(key, cached);
+    } else {
+      const bl = new Uint16Array(e - s + 1);
+      const bd = new Uint16Array(e - s + 1);
+      bl.set(baseL.subarray(a, z));
+      bd.set(baseD.subarray(a, z));
+      r = iterateRange(eng, L, s, e, bl, bd, z - a, blockIters, huffIters, patience, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
+      // Only probe litheavy alt basin on substantial literal-rich blocks!
+      if (blockAltBasin && (z - a) >= 4000) {
+        let lits = 0;
+        for (let i = 0; i < r.m; i++) if (bd[i] === 0) lits++;
+        if (lits > r.m * 0.45) {
+          costsFromLitHeavy(data, s, e);
+          const bl2 = new Uint16Array(e - s + 1);
+          const bd2 = new Uint16Array(e - s + 1);
+          const m0 = eng.parseRange(L, s, e, litCostI32, lenCostI32, distCostI32, bl2, bd2, 0);
+          const r2 = iterateRange(eng, L, s, e, bl2, bd2, m0, Math.max(2, blockIters - 1), huffIters, 1, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
+          if (r2.bits < r.bits) {
+            r = r2;
+            bl.set(bl2.subarray(0, r2.m));
+            bd.set(bd2.subarray(0, r2.m));
+          }
+        }
+      }
+      const cl = bl.slice(0, r.m), cd = bd.slice(0, r.m);
+      outL.set(cl, w);
+      outD.set(cd, w);
+      w += r.m;
+      byteMap.set(key, { lit: cl, dist: cd, bits: r.bits });
+    }
+    starts.push(w);
+    byteStarts.push(e);
+    totalBits += r.bits;
+    pos = e;
+  }
+
+  // Final adjacent merge check (with RLE-smoothed dynamic bits)
+  let merged = true;
+  while (merged && starts.length > 2) {
+    merged = false;
+    for (let b = 0; b + 2 < starts.length; b++) {
+      const a0 = starts[b], a1 = starts[b + 1], a2 = starts[b + 2];
+      const sep = blockBits(outL, outD, a0, a1, true) + blockBits(outL, outD, a1, a2, true);
+      const comb = blockBits(outL, outD, a0, a2, true);
+      if (comb <= sep) {
+        starts.splice(b + 1, 1);
+        byteStarts.splice(b + 1, 1);
+        totalBits -= (sep - comb);
+        merged = true;
+        break;
+      }
+    }
+  }
+
+  return { lit: outL, dist: outD, starts, byteStarts, bits: totalBits, byteMap };
+}
+
+export function deflateRawWasm(data, opts = {}) {
+  const n = data.length;
+  const cut = opts.cut ?? 384;
+  const nice = opts.nice ?? 259;
+  const iters = opts.iters ?? 3;
+  const blockIters = opts.blockIters ?? 4;
+  const huffIters = opts.huffIters ?? 2;
+  const patience = opts.patience ?? 1;
+  const maxBlocks = opts.maxBlocks ?? 200;
+  const minSyms = opts.minSyms ?? 256;
+  const initChunks = opts.initChunks ?? 180;
+  const passes = opts.passes ?? 2;
+  const basins = opts.basins ?? ['fixed', 'litheavy'];
+  const blockAltBasin = opts.blockAltBasin ?? true;
+
+  const eng = getWasmEngine();
+  const L = eng.prepareMatches(data, cut, nice);
+
   const gL = new Uint16Array(n + 1);
   const gD = new Uint16Array(n + 1);
-  let m;
-  if (opts.init === 'static') {
-    // Start from a parse under a plain model: literals by the data's own byte frequencies, a length symbol and a
-    // distance code at lenBits and distBits plus their extra bits.
-    const counts = new Float64Array(256);
-    for (let i = 0; i < n; i++) counts[data[i]]++;
-    const c0 = ctx.costs;
-    // A Huffman code spends at least a bit a symbol.
-    for (let b = 0; b < 256; b++) c0.lit[b] = Math.max(1, Math.log2(n / (counts[b] + 0.5)));
-    for (let l = 3; l < 259; l++) c0.len[l] = (opts.lenBits ?? 6) + LEXT[l];
-    for (let c = 0; c < 30; c++) c0.dist[c] = (opts.distBits ?? 5) + DIST_EXTRA[c];
-    m = parse(data, mf, 0, n, c0, gL, gD, 0, ctx.work);
-    // Keep the greedy parse instead when it is the smaller start.
-    const mg = greedy(data, mf, 0, n, ctx.aL, ctx.aD, 0);
-    if (blockBits(ctx.aL, ctx.aD, 0, mg) < blockBits(gL, gD, 0, m)) {
-      gL.set(ctx.aL.subarray(0, mg));
-      gD.set(ctx.aD.subarray(0, mg));
-      m = mg;
-    }
-  } else m = greedy(data, mf, 0, n, gL, gD, 0);
-  m = iterate(ctx, 0, n, gL, gD, m, iters).m;
+  const candL = new Uint16Array(n + 1);
+  const candD = new Uint16Array(n + 1);
+  const tmpA_L = new Uint16Array(n + 1);
+  const tmpA_D = new Uint16Array(n + 1);
+  const tmpB_L = new Uint16Array(n + 1);
+  const tmpB_D = new Uint16Array(n + 1);
 
-  // Split, re-parse each block under its own model; then split that result again, and keep the better.
-  const minSyms = opts.minSyms ?? 512;
-  let best = splitPass(ctx, gL, gD, m, minSyms, maxBlocks, blockIters);
+  let bestM = 0;
+  let bestGlobalBits = Infinity;
+
+  for (const basin of basins) {
+    if (basin === 'fixed') costsFromFixed();
+    else if (basin === 'litheavy') costsFromLitHeavy(data, 0, n);
+    const m0 = eng.parseRange(L, 0, n, litCostI32, lenCostI32, distCostI32, candL, candD, 0);
+    const gHuff = basin === 'litheavy' ? 1 : 0;
+    const r = iterateRange(eng, L, 0, n, candL, candD, m0, iters, gHuff, patience, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
+    if (r.bits < bestGlobalBits) {
+      bestGlobalBits = r.bits;
+      bestM = r.m;
+      gL.set(candL.subarray(0, r.m));
+      gD.set(candD.subarray(0, r.m));
+    }
+  }
+
+  let best = splitAndOptimize(eng, L, data, gL, gD, bestM, null, minSyms, maxBlocks, initChunks, blockIters, huffIters, patience, blockAltBasin, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
   for (let p = 1; p < passes; p++) {
-    const next = splitPass(ctx, best.lit, best.dist, best.starts[best.starts.length - 1], minSyms, maxBlocks, blockIters);
+    const p2Iters = Math.max(1, Math.min(2, blockIters - 1));
+    const p2Huff = Math.max(1, huffIters - 1);
+    const next = splitAndOptimize(eng, L, data, best.lit, best.dist, best.starts[best.starts.length - 1], best.byteMap, minSyms, maxBlocks, initChunks, p2Iters, p2Huff, 1, false, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
     if (next.bits < best.bits) best = next;
     else break;
   }
 
   const out = new Bits(Math.max(1024, n >>> 3));
   const st = best.starts;
-  for (let b = 0; b + 1 < st.length; b++) writeBlock(out, best.lit, best.dist, st[b], st[b + 1], b + 2 === st.length);
+  const bst = best.byteStarts;
+  for (let b = 0; b + 1 < st.length; b++) {
+    writeBlock(out, data, bst[b], bst[b + 1], best.lit, best.dist, st[b], st[b + 1], b + 2 === st.length);
+  }
   return out.finish();
 }
 
-/**
- * Iterate the cost model over bytes [s, e), starting from the symbols in (L, D)[0, m): each round parses under the
- * statistics of the round before; the best parse by its block bits is kept in (L, D). Returns {m, bits}.
- */
-const mixLL = new Int32Array(288);
-const mixD = new Int32Array(30);
-
-function iterate(ctx, s, e, L, D, m, iters) {
-  const { data, mf, costs, work } = ctx;
-  let bestBits = blockBits(L, D, 0, m);
-  let curL = L;
-  let curD = D;
-  let curM = m;
-  let tL = ctx.aL;
-  let tD = ctx.aD;
-  let oL = ctx.bL;
-  let oD = ctx.bD;
-  let fails = 0;
-  let mix = false;
-  let mixed = false;
-  // With fullIters > 0, the first `iters` rounds parse cheaply (short lengths only), since they serve to settle the
-  // statistics; then up to fullIters rounds parse with every length the settings allow.
-  const nFull = ctx.fullIters;
-  const fullCap = work.cap;
-  const fullEnds = work.ends;
-  const fullFresh = work.fresh;
-  let full = nFull === 0;
-  let fullDone = 0;
-  const rounds = nFull === 0 ? iters : iters + nFull;
-  for (let it = 0; it < rounds; it++) {
-    if (!full && it >= iters) {
-      full = true;
-      fails = 0;
-    }
-    work.cap = full ? fullCap : ctx.cheapCap;
-    work.ends = full ? fullEnds : false;
-    work.fresh = full ? fullFresh : false;
-    if (mix) {
-      // Stuck: the statistics of the best parse and the last one together.
-      histogram(L, D, 0, m);
-      mixLL.set(llC);
-      mixD.set(dC);
-      histogram(curL, curD, 0, curM);
-      for (let k = 0; k < 288; k++) mixLL[k] += llC[k];
-      for (let k = 0; k < 30; k++) mixD[k] += dC[k];
-      costs.fromCounts(mixLL, mixD);
-      mix = false;
-    } else statsOf(curL, curD, 0, curM, costs);
-    const m2 = parse(data, mf, s, e, costs, tL, tD, 0, work);
-    const bits = blockBits(tL, tD, 0, m2);
-    if (bits < bestBits) {
-      bestBits = bits;
-      L.set(tL.subarray(0, m2));
-      D.set(tD.subarray(0, m2));
-      m = m2;
-      fails = 0;
-    } else if (++fails >= ctx.patience) {
-      if (!full) {
-        // Settled: go on to the full rounds.
-        full = true;
-        fails = 0;
-        it = iters - 1;
-      } else if (mixed || !ctx.mix) break;
-      else {
-        mix = true;
-        mixed = true;
-        fails = 0;
-      }
-    }
-    if (full && nFull > 0 && ++fullDone >= nFull) break;
-    curL = tL;
-    curD = tD;
-    curM = m2;
-    [tL, oL] = [oL, tL];
-    [tD, oD] = [oD, tD];
-  }
-  work.cap = fullCap;
-  work.ends = fullEnds;
-  work.fresh = fullFresh;
-  return { m, bits: bestBits };
-}
-
-/** Split symbols (L, D)[0, m) into blocks, re-parse each block under its own model: {lit, dist, starts, bits}. */
-function splitPass(ctx, L, D, m, minSyms, maxBlocks, blockIters) {
-  const n = ctx.data.length;
-  const sp = splitPoints(L, D, 0, m, minSyms, maxBlocks);
-  const symB = [0, ...sp, m];
-  const outL = new Uint16Array(n + 1);
-  const outD = new Uint16Array(n + 1);
-  const starts = [0];
-  let w = 0;
-  let pos = 0;
-  let bits = 0;
-  for (let b = 0; b + 1 < symB.length; b++) {
-    const a = symB[b];
-    const z = symB[b + 1];
-    const s = pos;
-    const e = s + bytesOf(L, D, a, z);
-    const bl = new Uint16Array(e - s + 1);
-    const bd = new Uint16Array(e - s + 1);
-    bl.set(L.subarray(a, z));
-    bd.set(D.subarray(a, z));
-    const r = iterate(ctx, s, e, bl, bd, z - a, blockIters);
-    outL.set(bl.subarray(0, r.m), w);
-    outD.set(bd.subarray(0, r.m), w);
-    w += r.m;
-    starts.push(w);
-    bits += r.bits;
-    pos = e;
-  }
-  return { lit: outL, dist: outD, starts, bits };
-}
+export { deflateRawWasm as deflateRaw };
 
 export function adler32(bytes) {
-  let a = 1;
-  let b = 0;
+  let a = 1, b = 0;
   for (let i = 0; i < bytes.length; ) {
     const end = Math.min(bytes.length, i + 5552);
-    for (; i < end; i++) {
-      a += bytes[i];
-      b += a;
-    }
-    a %= 65521;
-    b %= 65521;
+    for (; i < end; i++) { a += bytes[i]; b += a; }
+    a %= 65521; b %= 65521;
   }
   return ((b << 16) | a) >>> 0;
 }
 
-/** A zlib stream around a raw DEFLATE stream of `data`. */
 export function zlibWrap(raw, data) {
   const out = new Uint8Array(raw.length + 6);
-  out[0] = 0x78;
-  out[1] = 0xda;
+  out[0] = 0x78; out[1] = 0xda;
   out.set(raw, 2);
   const ad = adler32(data);
   const at = raw.length + 2;

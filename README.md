@@ -2,35 +2,33 @@
 
 [![make.fun · png-squeeze-01-run-20261127](https://make.fun/badge/png-squeeze-01-run-20261127.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
 [![rank](https://make.fun/badge/png-squeeze-01-run-20261127/SimplyMar/png-squeeze-01-run-20261127/rank.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
-[![reward](https://make.fun/badge/png-squeeze-01-run-20261127/SimplyMar/png-squeeze-01-run-20261127/reward.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
+[![reward](https://make.fun/badge/png-squeeze-01-run-20261127/SimplyMar/png-squeeze-01-run-20261127/reward.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
 
-A lossless PNG squeezer for screenshots, written for the make.fun bounty
+A deterministic lossless PNG squeezer for desktop screenshots, written for the make.fun bounty
 [png-squeeze-01-run-20261127](https://make.fun/bounty/png-squeeze-01-run-20261127). Node 22, standard library only,
-no dependencies.
+no external dependencies or prebuilt binaries.
 
 ## How it works
 
-1. **Colour form** (`squeeze.mjs`): a palette (colour type 3) when the image has at most 256 colours, else grey (0),
-   grey + alpha (4), RGB (2) or RGBA (6), with a tRNS key instead of an alpha channel when a single fully transparent
-   value allows it. Bit depth stays 8 and only IHDR, PLTE, tRNS, IDAT and IEND are written.
-2. **Filters** (`squeeze.mjs`, `png.mjs`): filter 0, and a filter per band of 16 rows chosen by zlib with the
-   32 KiB before the band as dictionary (a filter kept over many rows lets LZ match rows against the rows above them);
-   grey images also try a per-row brute force, palettes filter 0 and the minimum sum. Candidates are screened with
-   zlib level 6; when zlib prefers the filtered palette, the unfiltered one is written too and the smaller kept.
-3. **DEFLATE** (`deflate.mjs`, written for this entry): binary-tree match finder over the 32 KiB window (a node already
-   known to match from the position before skips its compare), an optimal parse under an iterated entropy cost model
-   started from the data's own byte statistics, where a match that merely continues one from the position before is
-   relaxed only at short lengths and the ends of length codes, block splitting with each block re-parsed under its own
-   model (grey images get more rounds), length-limited Huffman codes and the smallest RLE of the code-length header. The stream is inflated back and
-   compared before it is used; zlib's stream is the fallback.
+1. **Colour form** (`squeeze.mjs`, `png.mjs`): palette (colour type 3, ordered by frequency) when the image has at most
+   256 colours and is not grey; else grey (0), grey + alpha (4), RGB (2) or RGBA (6), with a tRNS key replacing alpha
+   when a single fully transparent value allows it. Bit depth stays 8 and only IHDR, PLTE, tRNS, IDAT and IEND are written.
+2. **Filters** (`squeeze.mjs`, `png.mjs`): 5-state dictionary-carrying Strip Viterbi DP over 8-row and 16-row bands
+   (switching to `Z_FILTERED` strategy on literal-heavy photo images), fast 2-stage 1-row transition snapping around
+   filter changes, SmartUp exact-repeat row overlay (preserving all-zero/flat runs), and per-row brute force on grey.
+   Candidates are screened with zlib levels 6 and 8 (plus `Z_FILTERED` for photo regimes); on 1-bpp images, a close
+   distinct runner-up is also DEFLATE-encoded and the smaller PNG kept.
+3. **DEFLATE** (`deflate.mjs`, `wasm-core.mjs`): self-assembled inline WebAssembly BT3 match finder and O(1) RMQ
+   Exact-258 shortest-path parser with exact multi-block deep-run skipping, dual-basin (fixed + empirical literal-heavy)
+   iterated cost models with integer Huffman-length polish, incremental-histogram bottom-up agglomerative block merge
+   and boundary sliding, exact Package-Merge length-limited Huffman codes, and shortest-path DP header RLE with count
+   smoothing. Every stream is inflated back and verified byte-for-byte against the filtered buffer before use.
 
-The work done depends only on the input (no clock, no randomness), so two runs write identical bytes.
+All computation depends strictly on input bytes (no clock, no randomness), guaranteeing identical bytes across runs,
+with a deterministic byte-counted budget to stay well inside the 60 s wall limit on heavy sets.
 
-Local practice set: **797,389 / 1,000,000**. The work is sized well inside the grader's 60 s wall on one core: a
-deterministic budget (counted in bytes, never the clock) lightens the costliest images of an unusually heavy set.
-
-`main.ts` only starts `squeeze.mjs` in a child Node process: on Node 22 a `.ts` entry loads the TypeScript stripper,
-which slows all later JavaScript in that process by about a half.
+`main.ts` launches `squeeze.mjs` in a plain `.mjs` child process so Node 22's TypeScript stripper does not slow the
+hot loop.
 
 ## Run it
 
