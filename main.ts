@@ -1,8 +1,8 @@
 // png-squeeze entry: each screenshot rewritten as the smallest lossless PNG this program finds.
 //   1. Forms: a palette when the image has at most 256 colours (and is not grey); grey, grey+alpha, RGB or RGBA
 //      otherwise, with a tRNS key in place of alpha when one fully transparent value allows it.
-//   2. Filters: each form filtered by filter 0 and a per-row entropy heuristic (bruteTypes, a per-row brute force by zlib,
-//      is kept for heavier settings); every candidate screened by zlib at level 6.
+//   2. Filters: each form filtered by filter 0, a per-row entropy heuristic and a per-row brute force weighed by zlib
+//      with the 32 KiB written before the row as its dictionary; every candidate screened by zlib at level 6.
 //   3. The winner written by this entry's own DEFLATE (deflate.mjs): binary-tree matches, an optimal parse under an
 //      iterated cost model, and block splitting. The stream is inflated back and compared before it is used.
 // No clock, randomness or environment (beyond the input and output directories) is read: the work is fixed by the
@@ -17,7 +17,7 @@ const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const SCREEN = { level: 6, memLevel: 9 };
-const DEFLATE = { chain: 256, nice: 300, cap: 16, iters: 3, blockIters: 2, maxBlocks: 40, minSyms: 1024, patience: 1, passes: 1 };
+const DEFLATE = { chain: 256, nice: 300, cap: 16, iters: 4, blockIters: 3, maxBlocks: 40, minSyms: 1024, patience: 1, passes: 1 };
 
 /**
  * Per-row brute force: each row's filter the one whose filtered row zlib (at `level`) codes smallest after the 32 KiB
@@ -80,7 +80,7 @@ function formsOf(rgba) {
     if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
   }
   const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct];
-  return [{ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: [0, 'entropy'] }];
+  return [{ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: [0, 'entropy', 'brute4'] }];
 }
 
 function typesOf(form, width, height, f) {
