@@ -17,6 +17,16 @@ for (let c = 0; c < 29; c++) {
     LEXT[l] = LEN_EXTRA[c];
   }
 }
+// NEXT_END[L]: the smallest length >= L that is the last of its length code (258 past the last).
+const NEXT_END = new Uint16Array(260);
+{
+  let end = 258;
+  NEXT_END[259] = 259;
+  for (let L = 258; L >= 0; L--) {
+    if (L >= 3 && (L === 258 || LSYM[L + 1] !== LSYM[L])) end = L;
+    NEXT_END[L] = end;
+  }
+}
 const DSYM = new Uint8Array(32769);
 for (let c = 0; c < 30; c++) {
   const end = c < 29 ? DIST_BASE[c + 1] : 32769;
@@ -33,9 +43,11 @@ for (let c = 0; c < 30; c++) {
  */
 export function findMatchesBT(data, cut, nice) {
   const n = data.length;
-  const HBITS = 20;
+  const HBITS = 24;
   const head = new Int32Array(1 << HBITS).fill(-1);
-  const son = new Int32Array(2 * n);
+  // The tree's links in a cyclic buffer one window long (positions older than the window are never followed).
+  const CS = 32769;
+  const son = new Int32Array(2 * CS);
   const off = new Int32Array(n + 1);
   let cap = Math.max(1024, n);
   let lens = new Uint16Array(cap);
@@ -45,17 +57,18 @@ export function findMatchesBT(data, cut, nice) {
   for (let i = 0; i < n; i++) {
     off[i] = m;
     const lenLimit = n - i < 258 ? n - i : 258;
+    const cp = i % CS;
     if (lenLimit < 3) {
-      son[2 * i] = -1;
-      son[2 * i + 1] = -1;
+      son[2 * cp] = -1;
+      son[2 * cp + 1] = -1;
       continue;
     }
     const record = i >= skipTo;
     const h = Math.imul((data[i] << 16) | (data[i + 1] << 8) | data[i + 2], 0x9e3779b1) >>> (32 - HBITS);
     let cur = head[h];
     head[h] = i;
-    let ptr0 = 2 * i + 1;
-    let ptr1 = 2 * i;
+    let ptr0 = 2 * cp + 1;
+    let ptr1 = 2 * cp;
     let len0 = 0;
     let len1 = 0;
     let best = 2;
@@ -66,7 +79,8 @@ export function findMatchesBT(data, cut, nice) {
         son[ptr1] = -1;
         break;
       }
-      const pair = 2 * cur;
+      const sl = cp - (i - cur);
+      const pair = 2 * (sl < 0 ? sl + CS : sl);
       let len = len0 < len1 ? len0 : len1;
       if (data[cur + len] === data[i + len]) {
         while (++len < lenLimit) if (data[cur + len] !== data[i + len]) break;
@@ -410,6 +424,17 @@ function parse(data, mf, s, e, costs, lit, dist, at, work) {
         }
       }
       if (l > top) {
+        // Past `cap`, the last length of each length code (all lengths of one code cost the same) up to the longest.
+        if (work.ends) {
+          for (let L = NEXT_END[(prevL > top ? prevL : top) + 1]; L < l; L = NEXT_END[L + 1]) {
+            const w = base + lenC[L];
+            if (w < cost[i + L]) {
+              cost[i + L] = w;
+              cLen[i + L] = L;
+              cDist[i + L] = d;
+            }
+          }
+        }
         const w = base + lenC[l];
         if (w < cost[i + l]) {
           cost[i + l] = w;
@@ -673,7 +698,7 @@ export function deflateRaw(data, opts = {}) {
     data,
     mf,
     costs: new Costs(),
-    work: { cost: new Float64Array(n + 1), cLen: new Uint16Array(n + 1), cDist: new Uint16Array(n + 1), cap: opts.cap ?? 258 },
+    work: { cost: new Float64Array(n + 1), cLen: new Uint16Array(n + 1), cDist: new Uint16Array(n + 1), cap: opts.cap ?? 258, ends: opts.ends ?? false },
     aL: new Uint16Array(n + 1),
     aD: new Uint16Array(n + 1),
     bL: new Uint16Array(n + 1),
