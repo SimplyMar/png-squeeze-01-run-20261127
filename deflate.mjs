@@ -1,4 +1,4 @@
-﻿// A DEFLATE encoder written for this entry: cached hash-chain matches, an optimal (shortest-path) parse under an
+// A DEFLATE encoder written for this entry: cached hash-chain matches, an optimal (shortest-path) parse under an
 // iterated entropy cost model, dynamic Huffman blocks with length-limited codes, and greedy block splitting. Everything
 // is integer or IEEE arithmetic over the input bytes alone, so the same input always yields the same stream.
 

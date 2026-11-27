@@ -1,4 +1,4 @@
-﻿// png-squeeze entry: each screenshot rewritten as the smallest lossless PNG this program finds.
+// png-squeeze entry: each screenshot rewritten as the smallest lossless PNG this program finds.
 //   1. Forms: a palette when the image has at most 256 colours (and is not grey); grey, grey+alpha, RGB or RGBA
 //      otherwise, with a tRNS key in place of alpha when one fully transparent value allows it.
 //   2. Filters: each form filtered by fixed filters, a row heuristic and two per-row brute forces weighed by zlib with
@@ -17,7 +17,7 @@ const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const SCREEN = { level: 9, memLevel: 9 };
-const DEFLATE = { chain: 256, nice: 300, cap: 16, iters: 10, blockIters: 10, maxBlocks: 80, patience: 1, passes: 1 };
+const DEFLATE = { chain: 256, nice: 300, cap: 16, iters: 14, blockIters: 14, maxBlocks: 160, minSyms: 256, patience: 2, passes: 2 };
 
 /**
  * Per-row brute force: each row's filter the one whose filtered row zlib (at `level`) codes smallest after the 32 KiB
