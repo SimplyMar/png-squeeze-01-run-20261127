@@ -43,7 +43,7 @@ for (let c = 0; c < 30; c++) {
  */
 export function findMatchesBT(data, cut, nice) {
   const n = data.length;
-  const HBITS = 24;
+  const HBITS = 20;
   const head = new Int32Array(1 << HBITS).fill(-1);
   // The tree's links in a cyclic buffer one window long (positions older than the window are never followed).
   const CS = 32769;
@@ -54,11 +54,16 @@ export function findMatchesBT(data, cut, nice) {
   let dists = new Uint16Array(cap);
   let m = 0;
   let skipTo = 0;
+  // The longest match of the position before, at distance kd and kl + 1 bytes long: the node at that distance shares
+  // at least kl bytes with this position, so its comparison starts there (the same lengths, far fewer byte compares).
+  let kd = 0;
+  let kl = 0;
   for (let i = 0; i < n; i++) {
     off[i] = m;
     const lenLimit = n - i < 258 ? n - i : 258;
     const cp = i % CS;
     if (lenLimit < 3) {
+      kl = 0;
       son[2 * cp] = -1;
       son[2 * cp + 1] = -1;
       continue;
@@ -72,6 +77,7 @@ export function findMatchesBT(data, cut, nice) {
     let len0 = 0;
     let len1 = 0;
     let best = 2;
+    let bestD = 0;
     let cnt = cut;
     for (;;) {
       if (cur < 0 || i - cur > 32768 || cnt-- === 0) {
@@ -82,10 +88,14 @@ export function findMatchesBT(data, cut, nice) {
       const sl = cp - (i - cur);
       const pair = 2 * (sl < 0 ? sl + CS : sl);
       let len = len0 < len1 ? len0 : len1;
-      if (data[cur + len] === data[i + len]) {
+      if (kl > len && i - cur === kd) len = kl < lenLimit ? kl : lenLimit;
+      if (len < lenLimit && data[cur + len] === data[i + len]) {
         while (++len < lenLimit) if (data[cur + len] !== data[i + len]) break;
+      }
+      {
         if (len > best) {
           best = len;
+          bestD = i - cur;
           if (record) {
             if (m >= cap) {
               cap *= 2;
@@ -119,6 +129,8 @@ export function findMatchesBT(data, cut, nice) {
         len0 = len;
       }
     }
+    kd = bestD;
+    kl = best >= 3 ? best - 1 : 0;
     if (record && best >= nice) skipTo = i + best;
   }
   off[n] = m;
@@ -387,6 +399,7 @@ function parse(data, mf, s, e, costs, lit, dist, at, work) {
   const N = e - s;
   const { cost, cLen, cDist } = work;
   const cap = work.cap;
+  const fresh = work.fresh;
   cost[0] = 0;
   for (let i = 1; i <= N; i++) cost[i] = Infinity;
   const { off, lens, dists } = mf;
@@ -414,7 +427,22 @@ function parse(data, mf, s, e, costs, lit, dist, at, work) {
       const base = c + distC[DSYM[d]];
       // Every length up to `cap`; past it only the segment's own longest (the positions inside a long match have
       // matches of their own, so the parse still reaches every end point).
-      const top = l < cap ? l : cap;
+      let top = l < cap ? l : cap;
+      if (fresh && l > top) {
+        // A match that does not continue one of the position before (same distance, at least as long) relaxes every length:
+        // a continuation's long lengths are reached as cheaply from where its match began.
+        let cont = false;
+        if (i > 0 && c >= cost[i - 1]) {
+          const pa = off[pos - 1];
+          for (let k2 = pa; k2 < a; k2++) {
+            if (dists[k2] === d && lens[k2] >= l) {
+              cont = true;
+              break;
+            }
+          }
+        }
+        if (!cont) top = l;
+      }
       for (let L = prevL + 1; L <= top; L++) {
         const w = base + lenC[L];
         if (w < cost[i + L]) {
@@ -698,19 +726,40 @@ export function deflateRaw(data, opts = {}) {
     data,
     mf,
     costs: new Costs(),
-    work: { cost: new Float64Array(n + 1), cLen: new Uint16Array(n + 1), cDist: new Uint16Array(n + 1), cap: opts.cap ?? 258, ends: opts.ends ?? false },
+    work: { cost: new Float64Array(n + 1), cLen: new Uint16Array(n + 1), cDist: new Uint16Array(n + 1), cap: opts.cap ?? 258, ends: opts.ends ?? false, fresh: opts.fresh ?? false },
     aL: new Uint16Array(n + 1),
     aD: new Uint16Array(n + 1),
     bL: new Uint16Array(n + 1),
     bD: new Uint16Array(n + 1),
     patience,
     mix: opts.mix ?? false,
+    fullIters: opts.fullIters ?? 0,
+    cheapCap: opts.cheapCap ?? 8,
   };
 
   // Global: greedy, then iterate the cost model.
   const gL = new Uint16Array(n + 1);
   const gD = new Uint16Array(n + 1);
-  let m = greedy(data, mf, 0, n, gL, gD, 0);
+  let m;
+  if (opts.init === 'static') {
+    // Start from a parse under a plain model: literals by the data's own byte frequencies, a length symbol and a
+    // distance code at lenBits and distBits plus their extra bits.
+    const counts = new Float64Array(256);
+    for (let i = 0; i < n; i++) counts[data[i]]++;
+    const c0 = ctx.costs;
+    // A Huffman code spends at least a bit a symbol.
+    for (let b = 0; b < 256; b++) c0.lit[b] = Math.max(1, Math.log2(n / (counts[b] + 0.5)));
+    for (let l = 3; l < 259; l++) c0.len[l] = (opts.lenBits ?? 6) + LEXT[l];
+    for (let c = 0; c < 30; c++) c0.dist[c] = (opts.distBits ?? 5) + DIST_EXTRA[c];
+    m = parse(data, mf, 0, n, c0, gL, gD, 0, ctx.work);
+    // Keep the greedy parse instead when it is the smaller start.
+    const mg = greedy(data, mf, 0, n, ctx.aL, ctx.aD, 0);
+    if (blockBits(ctx.aL, ctx.aD, 0, mg) < blockBits(gL, gD, 0, m)) {
+      gL.set(ctx.aL.subarray(0, mg));
+      gD.set(ctx.aD.subarray(0, mg));
+      m = mg;
+    }
+  } else m = greedy(data, mf, 0, n, gL, gD, 0);
   m = iterate(ctx, 0, n, gL, gD, m, iters).m;
 
   // Split, re-parse each block under its own model; then split that result again, and keep the better.
@@ -748,7 +797,23 @@ function iterate(ctx, s, e, L, D, m, iters) {
   let fails = 0;
   let mix = false;
   let mixed = false;
-  for (let it = 0; it < iters; it++) {
+  // With fullIters > 0, the first `iters` rounds parse cheaply (short lengths only), since they serve to settle the
+  // statistics; then up to fullIters rounds parse with every length the settings allow.
+  const nFull = ctx.fullIters;
+  const fullCap = work.cap;
+  const fullEnds = work.ends;
+  const fullFresh = work.fresh;
+  let full = nFull === 0;
+  let fullDone = 0;
+  const rounds = nFull === 0 ? iters : iters + nFull;
+  for (let it = 0; it < rounds; it++) {
+    if (!full && it >= iters) {
+      full = true;
+      fails = 0;
+    }
+    work.cap = full ? fullCap : ctx.cheapCap;
+    work.ends = full ? fullEnds : false;
+    work.fresh = full ? fullFresh : false;
     if (mix) {
       // Stuck: the statistics of the best parse and the last one together.
       histogram(L, D, 0, m);
@@ -769,17 +834,28 @@ function iterate(ctx, s, e, L, D, m, iters) {
       m = m2;
       fails = 0;
     } else if (++fails >= ctx.patience) {
-      if (mixed || !ctx.mix) break;
-      mix = true;
-      mixed = true;
-      fails = 0;
+      if (!full) {
+        // Settled: go on to the full rounds.
+        full = true;
+        fails = 0;
+        it = iters - 1;
+      } else if (mixed || !ctx.mix) break;
+      else {
+        mix = true;
+        mixed = true;
+        fails = 0;
+      }
     }
+    if (full && nFull > 0 && ++fullDone >= nFull) break;
     curL = tL;
     curD = tD;
     curM = m2;
     [tL, oL] = [oL, tL];
     [tD, oD] = [oD, tD];
   }
+  work.cap = fullCap;
+  work.ends = fullEnds;
+  work.fresh = fullFresh;
   return { m, bits: bestBits };
 }
 

@@ -13,16 +13,20 @@ no dependencies.
 1. **Colour form** (`squeeze.mjs`): a palette (colour type 3) when the image has at most 256 colours, else grey (0),
    grey + alpha (4), RGB (2) or RGBA (6), with a tRNS key instead of an alpha channel when a single fully transparent
    value allows it. Bit depth stays 8 and only IHDR, PLTE, tRNS, IDAT and IEND are written.
-2. **Filters** (`squeeze.mjs`, `png.mjs`): filter 0, a per-row entropy heuristic and a per-row brute force (each row
-   compressed after the 32 KiB already chosen before it) are screened with zlib level 6; the smallest wins.
-3. **DEFLATE** (`deflate.mjs`, written for this entry): binary-tree match finder over the 32 KiB window, a shortest-path
-   (optimal) parse under an iterated entropy cost model (every length up to 32, then the last length of each length code), greedy block splitting with each
-   block re-parsed under its own model, length-limited Huffman codes and the smallest RLE of the code-length header.
-   The stream is inflated back and compared before it is used; zlib's stream is the fallback.
+2. **Filters** (`squeeze.mjs`, `png.mjs`): filter 0, and a filter per band of 16 rows chosen by zlib with the
+   32 KiB before the band as dictionary (a filter kept over many rows lets LZ match rows against the rows above them);
+   grey images also try a per-row brute force, palettes filter 0 and the minimum sum. Candidates are screened with
+   zlib level 6; a palette's two candidates are both written by the encoder below and the smaller kept.
+3. **DEFLATE** (`deflate.mjs`, written for this entry): binary-tree match finder over the 32 KiB window (a node already
+   known to match from the position before skips its compare), an optimal parse under an iterated entropy cost model
+   started from the data's own byte statistics, where a match that merely continues one from the position before is
+   relaxed only at short lengths and the ends of length codes, block splitting with each block re-parsed under its own
+   model, length-limited Huffman codes and the smallest RLE of the code-length header. The stream is inflated back and
+   compared before it is used; zlib's stream is the fallback.
 
 The work done depends only on the input (no clock, no randomness), so two runs write identical bytes.
 
-Local practice set: **780,741 / 1,000,000**. The work is sized well inside the grader's 60 s wall on one core: a
+Local practice set: **793,367 / 1,000,000**. The work is sized well inside the grader's 60 s wall on one core: a
 deterministic budget (counted in bytes, never the clock) lightens the costliest images of an unusually heavy set.
 
 `main.ts` only starts `squeeze.mjs` in a child Node process: on Node 22 a `.ts` entry loads the TypeScript stripper,
