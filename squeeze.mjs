@@ -2,8 +2,8 @@
 //   1. Forms: a palette when the image has at most 256 colours (and is not grey); grey, grey+alpha, RGB or RGBA
 //      otherwise, with a tRNS key in place of alpha when one fully transparent value allows it.
 //   2. Filters: filter 0, and one filter a band of 16 rows chosen by zlib with the 32 KiB before the band as its
-//      dictionary (grey images also a per-row brute force; a palette filter 0 and the minimum sum), screened by zlib
-//      at level 6. A palette's two candidates are both written, the smaller kept.
+//      dictionary (zlib level 9; grey images also a per-row brute force; a palette filter 0 and the minimum sum),
+//      screened by zlib at level 6. A filtered palette that zlib prefers is written beside the unfiltered one.
 //   3. The winner written by this entry's own DEFLATE (deflate.mjs): binary-tree matches, an optimal parse under an
 //      iterated cost model started from the data's own byte statistics, and block splitting. The stream is inflated
 //      back and compared before it is used.
@@ -20,7 +20,7 @@ const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const SCREEN = { level: 6, memLevel: 9 };
 const TOP2 = 0;
-const DEFLATE = { chain: 256, nice: 300, cap: 8, ends: true, fresh: true, init: 'static', iters: 2, blockIters: 2, maxBlocks: 40, minSyms: 1024, patience: 1, passes: 1 };
+const DEFLATE = { chain: 256, nice: 300, cap: 8, ends: true, fresh: true, init: 'static', iters: 1, blockIters: 3, maxBlocks: 200, minSyms: 256, patience: 1, passes: 1 };
 
 /**
  * Per-row brute force: each row's filter the one whose filtered row zlib (at `level`) codes smallest after the 32 KiB
@@ -121,13 +121,14 @@ function formsOf(rgba) {
     if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
   }
   const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct];
-  return [{ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: grey ? [0, 'brute4', 'band16'] : [0, 'band16'] }];
+  return [{ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: grey ? [0, 'brute4', 'band16'] : [0, 'band16x9'] }];
 }
 
 function typesOf(form, width, height, f) {
   if (typeof f === 'number') return new Uint8Array(height).fill(f);
   if (f === 'brute4') return bruteTypes(form.samples, width, height, form.bpp, 4, 0);
   if (f === 'band16') return bandTypes(form.samples, width, height, form.bpp, 16, 6);
+  if (f === 'band16x9') return bandTypes(form.samples, width, height, form.bpp, 16, 9);
   if (f === 'band32') return bandTypes(form.samples, width, height, form.bpp, 32, 6);
   return heuristicTypes(form.samples, width, height, form.bpp, f);
 }
@@ -140,14 +141,16 @@ function screen(rgba, width, height) {
     for (const f of form.filters) {
       const raw = applyFilters(form.samples, width, height, form.bpp, typesOf(form, width, height, f));
       const z = deflateSync(raw, SCREEN);
-      all.push({ size: z.length + extra, raw, form: { colourType: form.colourType, plte: form.plte, trns: form.trns }, z, width, height });
+      all.push({ f, size: z.length + extra, raw, form: { colourType: form.colourType, plte: form.plte, trns: form.trns }, z, width, height });
     }
   }
   // The smallest first, the earlier on a tie; the runner-up is written too when zlib puts it within TOP2 of the best.
   const order = all.map((c, k) => k).sort((x, y) => all[x].size - all[y].size || x - y);
   const best = all[order[0]];
-  // A palette's two candidates are both written (zlib ranks them unlike this entry's DEFLATE, and they are small).
-  best.second = order.length > 1 && (best.form.colourType === 3 || all[order[1]].size <= best.size * TOP2) ? all[order[1]] : null;
+  // When zlib prefers a filtered palette, the unfiltered one is written too: this entry's DEFLATE, with its long
+  // matches, often ranks them the other way round (never the reverse).
+  const palette = best.form.colourType === 3 && best.f !== 0;
+  best.second = order.length > 1 && (palette || all[order[1]].size <= best.size * TOP2) ? all[order[1]] : null;
   return best;
 }
 
@@ -178,6 +181,8 @@ function encode(best, settings, both) {
 // more steeply, with the bytes zlib could not squeeze. When the set's estimate passes BUDGET, the costliest images are
 // written with LIGHT settings (about half the work) until it fits.
 const BUDGET = 19000;
+// Grey images are small and literal-heavy: more rounds of the cost model pay there.
+const GREY = { ...DEFLATE, iters: 6, blockIters: 6, patience: 2, passes: 2 };
 const LIGHT = { ...DEFLATE, iters: 2, blockIters: 1, maxBlocks: 20, cap: 8, ends: false };
 const one = (s) => 0.8 * (s.raw.length / 1024) + 7 * (s.size / 1024);
 const costOf = (s) => one(s) + (s.second ? one(s.second) : 0);
@@ -209,7 +214,7 @@ for (const [id, s] of [...screened].sort((a, b) => costOf(b[1]) - costOf(a[1]) |
 }
 for (const [id, s] of screened) {
   try {
-    writeFileSync(join(O, id, 'image.png'), encode(s, light.has(id) ? LIGHT : DEFLATE, !light.has(id)));
+    writeFileSync(join(O, id, 'image.png'), encode(s, light.has(id) ? LIGHT : s.form.colourType === 0 || s.form.colourType === 4 ? GREY : DEFLATE, !light.has(id)));
   } catch {
     // The zlib answer written in phase 1 stands.
   }
