@@ -985,7 +985,13 @@ function polishKraftLengths(llCounts, dCounts, useLL, useD, extra, bestBits) {
           const b = evalDynamicBits(llCounts, dCounts, tr, useD, extra, true);
           if (b < bestBits) { bestBits = b; useLL.set(tr); improved = true; }
         }
-      } else if (v > 0 && L > 0 && L === R && v !== L && llCounts[i] <= 4) {
+      } else if (v > 0 && L > 0 && L === R && v !== L && llCounts[i] <= 8) {
+        const tr = kraftRebalance(llCounts, useLL, 286, [[i, L]]);
+        if (tr) {
+          const b = evalDynamicBits(llCounts, dCounts, tr, useD, extra, true);
+          if (b < bestBits) { bestBits = b; useLL.set(tr); improved = true; }
+        }
+      } else if (v > 0 && i >= 2 && L > 0 && L === useLL[i - 2] && v !== L && llCounts[i] <= 6) {
         const tr = kraftRebalance(llCounts, useLL, 286, [[i, L]]);
         if (tr) {
           const b = evalDynamicBits(llCounts, dCounts, tr, useD, extra, true);
@@ -1007,7 +1013,7 @@ function polishKraftLengths(llCounts, dCounts, useLL, useD, extra, bestBits) {
             if (b < bestBits) { bestBits = b; useD.set(tr); improved = true; break; }
           }
         }
-      } else if (v > 0 && L > 0 && L === R && v !== L && dCounts[i] <= 4) {
+      } else if (v > 0 && L > 0 && L === R && v !== L && dCounts[i] <= 8) {
         const tr = kraftRebalance(dCounts, useD, 30, [[i, L]]);
         if (tr) {
           const b = evalDynamicBits(llCounts, dCounts, useLL, tr, extra, true);
@@ -1457,6 +1463,22 @@ export function deflateRawWasm(data, opts = {}) {
           outData[i] = v < K ? fwd[v] : v;
         }
         opts.onPalPerm(bestInv, fwd, outData);
+
+        // Monotonic Post-Pal Re-Split: re-evaluate block boundaries under the cheaper permuted headers!
+        const spNew = splitHybridDP(outData, rowLen, best.lit, best.dist, endM, minSyms, maxBlocks, initChunks, dpCap, false, best.starts);
+        const newStarts = [0, ...spNew, endM];
+        let oldTot = 0, newTot = 0;
+        for (let b = 0; b + 1 < best.starts.length; b++) oldTot += blockBits(best.lit, best.dist, best.starts[b], best.starts[b + 1], true);
+        for (let b = 0; b + 1 < newStarts.length; b++) newTot += blockBits(best.lit, best.dist, newStarts[b], newStarts[b + 1], true);
+        if (newTot < oldTot) {
+          const newBst = [0];
+          let bp = 0;
+          for (let b = 0; b + 1 < newStarts.length; b++) {
+            bp += bytesOf(best.lit, best.dist, newStarts[b], newStarts[b + 1]);
+            newBst.push(bp);
+          }
+          best = { ...best, starts: newStarts, byteStarts: newBst };
+        }
       }
     }
   }

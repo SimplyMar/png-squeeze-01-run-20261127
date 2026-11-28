@@ -11,10 +11,12 @@ no external dependencies or prebuilt binaries.
 ## How it works
 
 1. **Colour form** (`squeeze.mjs`, `png.mjs`): palette (colour type 3, frequency-ordered plus 2-opt co-occurrence TSP
-   when filtered rows beat filter 0, followed by Post-Zopfli Palette RLE permutation of filter-invariant indices to
-   shrink multi-block Huffman headers) when the image has at most 256 colours and is not grey; else grey (0),
-   grey + alpha (4), RGB (2) or RGBA (6), with a tRNS key replacing alpha when a single fully transparent value allows
-   it. Bit depth stays 8 and only IHDR, PLTE, tRNS, IDAT and IEND are written.
+   when filtered rows beat filter 0, followed by Post-Zopfli Palette RLE permutation of filter-invariant indices and
+   monotonic post-permutation block re-splitting) when the image has at most 256 colours and is not grey; on opaque
+   greyscale images with spare palette slots, also evaluates an auto-detected photo-safe multi-ramp duplicate-palette
+   colour type 3 form that flood-fills flat UI text windows into contiguous 5-level anti-aliased ramps without touching
+   smooth gradients; else grey (0), grey + alpha (4), RGB (2) or RGBA (6), with a tRNS key replacing alpha when a single
+   fully transparent value allows it. Bit depth stays 8 and only IHDR, PLTE, tRNS, IDAT and IEND are written.
 2. **Filters** (`squeeze.mjs`, `png.mjs`): top-2 dictionary-carrying Strip Viterbi DP over 2-, 4-, 8-, and 16-row bands
    with untrapped dual-strategy (`min(Z_DEFAULT, Z_FILTERED)`) photo evaluation and dual-plan Viterbi recombination
    (`recombine2` + natural dup-run lookahead `recombine2Cuts`), fast 2-stage 1-row transition snapping, SmartUp

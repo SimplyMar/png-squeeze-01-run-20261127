@@ -22,8 +22,8 @@ const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const Z6 = { level: 6, memLevel: 9 };
 const Z6F = { level: 6, memLevel: 9, strategy: 1 };
-const Z8 = { level: 8, memLevel: 9 };
-const Z8F = { level: 8, memLevel: 9, strategy: 1 };
+const Z8 = { level: 8, memLevel: 8 };
+const Z8F = { level: 8, memLevel: 8, strategy: 1 };
 
 function precomputeFilteredRows(samples, width, height, bpp, allowed = [0, 1, 2, 3, 4]) {
   const stride = width * bpp;
@@ -141,6 +141,225 @@ function tspPaletteOrder(rgba, width, height, byCount) {
     if (!imp) break;
   }
   return idx.map((i) => byCount[i]);
+}
+
+function buildAutoGreyDup(pix, width, height, maxRamps = 2) {
+  const n = pix.length;
+  const used = new Uint8Array(256);
+  const cnt = new Int32Array(256);
+  const flatCnt = new Int32Array(256);
+  for (let i = 0; i < n; i++) { used[pix[i]] = 1; cnt[pix[i]]++; }
+  let freeCnt = 0;
+  let minUsed = 256, maxUsed = -1;
+  for (let i = 0; i < 256; i++) {
+    if (!used[i]) freeCnt++;
+    else { if (i < minUsed) minUsed = i; maxUsed = i; }
+  }
+  if (freeCnt < 5) return null;
+
+  for (let y = 1; y < height - 1; y++) {
+    const o = y * width;
+    for (let x = 1; x < width - 1; x++) {
+      const i = o + x, g = pix[i];
+      if (pix[i - 1] === g && pix[i + 1] === g && pix[i - width] === g && pix[i + width] === g) flatCnt[g]++;
+    }
+  }
+  const co = new Int32Array(65536);
+  for (let y = 0; y < height; y++) {
+    const o = y * width;
+    for (let x = 1; x < width; x++) {
+      const a = pix[o + x - 1], b = pix[o + x];
+      if (a !== b) { co[(a << 8) | b]++; co[(b << 8) | a]++; }
+    }
+    if (y > 0) {
+      for (let x = 0; x < width; x++) {
+        const a = pix[o - width + x], b = pix[o + x];
+        if (a !== b) { co[(a << 8) | b]++; co[(b << 8) | a]++; }
+      }
+    }
+  }
+
+  const bgs = [];
+  for (let g = 0; g < 256; g++) if (flatCnt[g] >= 10000) bgs.push(g);
+  bgs.sort((a, b) => flatCnt[b] - flatCnt[a] || a - b);
+
+  const ramps = [];
+  const maxR = Math.min(maxRamps, Math.floor(freeCnt / 5));
+  for (const bg of bgs) {
+    if (ramps.length >= maxR) break;
+    let bestScore = 0, bestVals = null;
+    for (let fg = 0; fg < 256; fg++) {
+      if (Math.abs(fg - bg) < 50 || cnt[fg] < 500) continue;
+      const vals = [bg, 0, 0, 0, fg];
+      let rampScore = co[(bg << 8) | fg];
+      let ok = true;
+      for (let k = 1; k <= 3; k++) {
+        const a = Math.round((255 * k) / 4);
+        const exp = Math.round((fg * a + bg * (255 - a)) / 255);
+        let bk = -1, bks = -1;
+        for (let d = -2; d <= 2; d++) {
+          const v = exp + d;
+          if (v < 0 || v > 255 || v === bg || v === fg) continue;
+          const s = co[(bg << 8) | v] + co[(fg << 8) | v];
+          if (s > bks) { bks = s; bk = v; }
+        }
+        if (bk < 0) { ok = false; break; }
+        vals[k] = bk;
+        rampScore += bks;
+      }
+      if (!ok) continue;
+      const midScore = co[(bg << 8) | vals[2]] + co[(fg << 8) | vals[2]] + co[(vals[1] << 8) | vals[2]] + co[(vals[2] << 8) | vals[3]];
+      const totalS = rampScore + midScore;
+      if (totalS > bestScore && totalS >= 3000) {
+        bestScore = totalS;
+        bestVals = vals;
+      }
+    }
+    if (bestVals) ramps.push({ bg, vals: bestVals, score: bestScore });
+  }
+  if (ramps.length === 0) return null;
+
+  const buildVariant = (useRamps) => {
+    const totalSlots = useRamps.length * 5;
+    let plteLen = 256;
+    const plteVal = new Uint8Array(256);
+    const canon = new Uint8Array(256);
+    let bestBase = 0;
+
+    if (minUsed >= totalSlots) {
+      // Shift minUsed..maxUsed down to totalSlots.. so all photo diffs stay 100% identical AND PLTE trims trailing unused slots!
+      const shift = minUsed - totalSlots;
+      plteLen = maxUsed - shift + 1;
+      for (let g = minUsed; g <= maxUsed; g++) {
+        const idx = g - shift;
+        plteVal[idx] = g;
+        canon[g] = idx;
+      }
+      bestBase = 0;
+    } else {
+      const free = [];
+      for (let i = 0; i < 256; i++) if (!used[i]) free.push(i);
+      let bestCost = Infinity;
+      for (let b = 0; b <= 256 - totalSlots; b++) {
+        let c = 0;
+        for (let k = 0; k < totalSlots; k++) if (used[b + k]) c += cnt[b + k];
+        if (c < bestCost) { bestCost = c; bestBase = b; if (c === 0) break; }
+      }
+      if (bestCost > 200) return null;
+      for (let i = 0; i < 256; i++) { plteVal[i] = i; canon[i] = i; }
+      let fi = 0;
+      for (let k = 0; k < totalSlots; k++) {
+        const s = bestBase + k;
+        if (used[s]) {
+          while (fi < free.length && free[fi] >= bestBase && free[fi] < bestBase + totalSlots) fi++;
+          if (fi >= free.length) return null;
+          const dst = free[fi++];
+          plteVal[dst] = s;
+          canon[s] = dst;
+        }
+      }
+      plteLen = Math.max(maxUsed + 1, bestBase + totalSlots);
+    }
+
+    const enc = new Uint8Array(n);
+    for (let i = 0; i < n; i++) enc[i] = canon[pix[i]];
+    const claimed = new Uint8Array(n);
+    const q = new Int32Array(n);
+    const seen = new Uint8Array(n);
+    let curSlot = bestBase;
+
+    for (const r of useRamps) {
+      const bg = r.bg;
+      const inR = new Int16Array(256).fill(-1);
+      for (let k = 0; k < 5; k++) { plteVal[curSlot] = r.vals[k]; inR[r.vals[k]] = curSlot++; }
+      seen.fill(0);
+      let qh = 0, qt = 0;
+      for (let y = 1; y < height - 1; y++) {
+        const o = y * width;
+        for (let x = 1; x < width - 1; x++) {
+          const i = o + x;
+          if (claimed[i]) continue;
+          if (pix[i] === bg && pix[i - 1] === bg && pix[i + 1] === bg && pix[i - width] === bg && pix[i + width] === bg) {
+            seen[i] = 1;
+            q[qt++] = i;
+          }
+        }
+      }
+      while (qh < qt) {
+        const i = q[qh++];
+        if (claimed[i]) continue;
+        claimed[i] = 1;
+        enc[i] = inR[pix[i]];
+        const x = i % width, y = (i / width) | 0;
+        if (x > 0) {
+          const ni = i - 1;
+          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
+            const g = pix[ni], nx = x - 1;
+            if (!((nx > 0 && inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
+              || (inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
+              || (y > 0 && inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
+              || (y + 1 < height && inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
+              seen[ni] = 1; q[qt++] = ni;
+            }
+          }
+        }
+        if (x + 1 < width) {
+          const ni = i + 1;
+          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
+            const g = pix[ni], nx = x + 1;
+            if (!((inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
+              || (nx + 1 < width && inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
+              || (y > 0 && inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
+              || (y + 1 < height && inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
+              seen[ni] = 1; q[qt++] = ni;
+            }
+          }
+        }
+        if (y > 0) {
+          const ni = i - width;
+          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
+            const g = pix[ni], ny = y - 1;
+            if (!((x > 0 && inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
+              || (x + 1 < width && inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
+              || (ny > 0 && inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
+              || (inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
+              seen[ni] = 1; q[qt++] = ni;
+            }
+          }
+        }
+        if (y + 1 < height) {
+          const ni = i + width;
+          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
+            const g = pix[ni], ny = y + 1;
+            if (!((x > 0 && inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
+              || (x + 1 < width && inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
+              || (inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
+              || (ny + 1 < height && inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
+              seen[ni] = 1; q[qt++] = ni;
+            }
+          }
+        }
+      }
+    }
+
+    // Strict lossless verification before returning
+    for (let i = 0; i < n; i++) if (plteVal[enc[i]] !== pix[i]) return null;
+    const plte = new Uint8Array(plteLen * 3);
+    for (let i = 0; i < plteLen; i++) {
+      const v = plteVal[i];
+      plte[i * 3] = v; plte[i * 3 + 1] = v; plte[i * 3 + 2] = v;
+    }
+    return { colourType: 3, bpp: 1, samples: enc, plte, trns: null };
+  };
+
+  const cands = [];
+  const v1 = buildVariant(ramps.slice(0, 1));
+  if (v1) cands.push(v1);
+  if (ramps.length >= 2) {
+    const v2 = buildVariant(ramps.slice(0, 2));
+    if (v2) cands.push(v2);
+  }
+  return cands.length ? cands : null;
 }
 
 function bruteRow(fRows, height, rowLen, level, bias) {
@@ -606,6 +825,37 @@ function screen(rgba, width, height) {
       }
     }
 
+    // Auto-detected photo-safe multi-ramp duplicate-palette CT 3 for opaque greyscale (collapses high-contrast AA text ramps into +-1..4!)
+    if (grey && opaque && ct === 0) {
+      const dupForms = buildAutoGreyDup(form.samples, width, height, 2);
+      if (dupForms) {
+        const z2Base = deflateSync(fRows[2], Z6).length;
+        let bestDup = null, bestDupZ2 = z2Base - 300;
+        for (const df of dupForms) {
+          const f2Row = new Uint8Array(height * rowLen);
+          for (let y = 0; y < height; y++) {
+            const at = y * rowLen;
+            f2Row[at] = 2;
+            filterRow(2, df.samples.subarray(y * width, (y + 1) * width), y ? df.samples.subarray((y - 1) * width, y * width) : null, 1, f2Row.subarray(at + 1, at + rowLen));
+          }
+          const z2D = deflateSync(f2Row, Z6).length + chunkOverhead(df);
+          if (z2D < bestDupZ2) { bestDupZ2 = z2D; bestDup = df; }
+        }
+        if (bestDup) {
+          const dRows = precomputeFilteredRows(bestDup.samples, width, height, 1);
+          const dInfo = analyzeRows(bestDup.samples, width, height, 1);
+          const dBr = bruteRow(dRows, height, rowLen, z4min > 125000 ? 3 : 4, isPhoto ? 2 : 4);
+          push('gdup_brute4', bestDup, dRows, rowLen, dBr, isPhoto, dInfo);
+          push('gdup_brute4+su2', bestDup, dRows, rowLen, smartUpOverlay(dBr, dInfo, 2, 1), isPhoto, dInfo);
+          const dV8 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 8), 5, judgeStrat, [0, 1, 2, 3, 4], isPhoto ? 15 : 0);
+          const dV8s = snapTransitions(dRows, height, rowLen, dV8, 4, judgeStrat);
+          push('gdup_vit8+snap', bestDup, dRows, rowLen, dV8s, isPhoto, dInfo);
+          const dRec = recombine2(dRows, height, rowLen, dBr, dV8s, 16, z4min > 120000 ? 4 : 5, -1, 0);
+          push('gdup_rec_br_v8', bestDup, dRows, rowLen, dRec, isPhoto, dInfo);
+        }
+      }
+    }
+
     // Universal untrapped dual-plan recombination for non-heavy multi-bpp (both photo and UI+photo hybrids!)
     if (!grey && !heavy) {
       const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), isPhoto ? 5 : 4, 1, [0, 1, 2, 3, 4], 15);
@@ -661,15 +911,15 @@ function screen(rgba, width, height) {
       if (topK.length >= maxK) break;
     }
   }
-  if (rawCands[0].form.colourType === 3) {
+  if (!grey && rawCands[0].form.colourType === 3) {
     for (const must of ['nat_lk8', 'rec_f0_su1', 'rec_f0_su1_8', 'rec_su1_vall+su1', 'f0+su1r2', 'rec_su1_v02']) {
       if (!seenFamily.has(baseOf(must))) {
         const found = rawCands.find((c) => c.name === must);
         if (found && addCand(found)) seenFamily.add(baseOf(must));
       }
     }
-  } else if (rawCands[0].form.colourType === 0) {
-    const musts = rawCands[0].isPhoto ? ['dualvit1', 'rec_br_v1d', 'rec_br_v8'] : ['rec_g_def_v4f+snap', 'vit4f+snap', 'vit2f+snap'];
+  } else if (grey) {
+    const musts = rawCands[0].isPhoto ? ['gdup_brute4', 'gdup_rec_br_v8', 'rec_br_v8'] : ['rec_g_def_v4f+snap', 'vit4f+snap', 'vit2f+snap'];
     for (const must of musts) {
       const found = rawCands.find((c) => c.name === must);
       if (found && !seenFamily.has(baseOf(must)) && addCand(found)) seenFamily.add(baseOf(must));
@@ -764,11 +1014,11 @@ function encodeCand(c, width, height, settings) {
 // Deterministic byte-counted work budget (never reads wall clock).
 const DEF_1BPP_SM = { cut: 320, hc3Cut: 24, hc4Cut: 64, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 1, passes: 2, minSyms: 64,  initChunks: 185, dpCap: 56, blockAltBasin: true };
 const DEF_1BPP    = { cut: 224, hc3Cut: 16, hc4Cut: 48, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 1, passes: 2, minSyms: 128, initChunks: 165, dpCap: 50, blockAltBasin: true };
-const DEF_NORM    = { cut: 224, hc3Cut: 0,  hc4Cut: 8,  nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 155, dpCap: 48, blockAltBasin: true };
+const DEF_NORM    = { cut: 224, hc3Cut: 0,  hc4Cut: 10, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 155, dpCap: 48, blockAltBasin: true };
 const DEF_PHOTO   = { cut: 224, hc3Cut: 0,  hc4Cut: 16, nice: 259, iters: 2, blockIters: 2, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 155, dpCap: 48, blockAltBasin: true };
 const DEF_LIGHT   = { cut: 144, hc3Cut: 0,  hc4Cut: 8,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 135, dpCap: 40, blockAltBasin: false };
 
-const BUDGET = 14800;
+const BUDGET = 14200;
 const oneCost = (c) => 0.35 * (c.raw.length / 1024) + 12.0 * (c.size / 1024);
 
 // Phase 1: screen every image and immediately write verified zlib PNG so every instance holds a valid answer.
