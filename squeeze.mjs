@@ -143,91 +143,135 @@ function tspPaletteOrder(rgba, width, height, byCount) {
   return idx.map((i) => byCount[i]);
 }
 
-function buildAutoGreyDup(pix, width, height, maxRamps = 2) {
+function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
   const n = pix.length;
   const used = new Uint8Array(256);
   const cnt = new Int32Array(256);
   const flatCnt = new Int32Array(256);
   for (let i = 0; i < n; i++) { used[pix[i]] = 1; cnt[pix[i]]++; }
-  let freeCnt = 0;
+  const usedVals = [];
   let minUsed = 256, maxUsed = -1;
   for (let i = 0; i < 256; i++) {
-    if (!used[i]) freeCnt++;
-    else { if (i < minUsed) minUsed = i; maxUsed = i; }
+    if (used[i]) { usedVals.push(i); if (i < minUsed) minUsed = i; maxUsed = i; }
   }
+  const freeCnt = 256 - usedVals.length;
   if (freeCnt < 5) return null;
 
-  for (let y = 1; y < height - 1; y++) {
-    const o = y * width;
-    for (let x = 1; x < width - 1; x++) {
-      const i = o + x, g = pix[i];
-      if (pix[i - 1] === g && pix[i + 1] === g && pix[i - width] === g && pix[i + width] === g) flatCnt[g]++;
-    }
-  }
   const co = new Int32Array(65536);
   for (let y = 0; y < height; y++) {
     const o = y * width;
-    for (let x = 1; x < width; x++) {
-      const a = pix[o + x - 1], b = pix[o + x];
-      if (a !== b) { co[(a << 8) | b]++; co[(b << 8) | a]++; }
-    }
-    if (y > 0) {
-      for (let x = 0; x < width; x++) {
-        const a = pix[o - width + x], b = pix[o + x];
-        if (a !== b) { co[(a << 8) | b]++; co[(b << 8) | a]++; }
+    for (let x = 0; x < width; x++) {
+      const g = pix[o + x];
+      if (x > 0 && x + 1 < width && y > 0 && y + 1 < height
+        && pix[o + x - 1] === g && pix[o + x + 1] === g && pix[o - width + x] === g && pix[o + width + x] === g) {
+        flatCnt[g]++;
       }
+      if (x > 0) { const a = pix[o + x - 1]; if (a !== g) { co[(a << 8) | g]++; co[(g << 8) | a]++; } }
+      if (y > 0) { const a = pix[o - width + x]; if (a !== g) { co[(a << 8) | g]++; co[(g << 8) | a]++; } }
     }
   }
 
   const bgs = [];
-  for (let g = 0; g < 256; g++) if (flatCnt[g] >= 10000) bgs.push(g);
+  for (let g = 0; g < 256; g++) if (flatCnt[g] >= 5000) bgs.push(g);
   bgs.sort((a, b) => flatCnt[b] - flatCnt[a] || a - b);
 
-  const ramps = [];
-  const maxR = Math.min(maxRamps, Math.floor(freeCnt / 5));
-  for (const bg of bgs) {
-    if (ramps.length >= maxR) break;
-    let bestScore = 0, bestVals = null;
+  // Chain-balanced geometric-mean affine AA ramp discovery (5-step or 3-step)
+  const findRampArms = (bg, excludeSet) => {
+    const arms = [];
     for (let fg = 0; fg < 256; fg++) {
-      if (Math.abs(fg - bg) < 50 || cnt[fg] < 500) continue;
-      const vals = [bg, 0, 0, 0, fg];
-      let rampScore = co[(bg << 8) | fg];
-      let ok = true;
-      for (let k = 1; k <= 3; k++) {
-        const a = Math.round((255 * k) / 4);
-        const exp = Math.round((fg * a + bg * (255 - a)) / 255);
-        let bk = -1, bks = -1;
-        for (let d = -2; d <= 2; d++) {
-          const v = exp + d;
-          if (v < 0 || v > 255 || v === bg || v === fg) continue;
-          const s = co[(bg << 8) | v] + co[(fg << 8) | v];
-          if (s > bks) { bks = s; bk = v; }
-        }
-        if (bk < 0) { ok = false; break; }
-        vals[k] = bk;
-        rampScore += bks;
+      if (fg === bg || excludeSet.has(fg) || Math.abs(fg - bg) < 32 || cnt[fg] < 400) continue;
+      const directW = co[(bg << 8) | fg];
+      const exp2 = Math.round((bg + fg) / 2);
+      let v2 = -1, s2 = 0;
+      for (let d = -2; d <= 2; d++) {
+        const v = exp2 + d;
+        if (v < 0 || v > 255 || v === bg || v === fg || excludeSet.has(v) || !used[v]) continue;
+        const wL = co[(bg << 8) | v], wR = co[(fg << 8) | v];
+        if (wL < 150 || wR < 150) continue;
+        const gm = wL * wR;
+        if (gm > s2) { s2 = gm; v2 = v; }
       }
-      if (!ok) continue;
-      const midScore = co[(bg << 8) | vals[2]] + co[(fg << 8) | vals[2]] + co[(vals[1] << 8) | vals[2]] + co[(vals[2] << 8) | vals[3]];
-      const totalS = rampScore + midScore;
-      if (totalS > bestScore && totalS >= 3000) {
-        bestScore = totalS;
-        bestVals = vals;
+      if (v2 < 0) continue;
+
+      const exp1 = Math.round(bg + (fg - bg) * 0.25);
+      const exp3 = Math.round(bg + (fg - bg) * 0.75);
+      let v1 = -1, s1 = 0, v3 = -1, s3 = 0;
+      for (let d = -2; d <= 2; d++) {
+        const v = exp1 + d;
+        if (v >= 0 && v <= 255 && v !== bg && v !== v2 && v !== fg && !excludeSet.has(v) && used[v]) {
+          const wL = co[(bg << 8) | v], wR = co[(v2 << 8) | v];
+          const gm = wL * wR + (wL + wR);
+          if (gm > s1) { s1 = gm; v1 = v; }
+        }
+        const u = exp3 + d;
+        if (u >= 0 && u <= 255 && u !== bg && u !== v2 && u !== fg && !excludeSet.has(u) && used[u]) {
+          const wL = co[(v2 << 8) | u], wR = co[(fg << 8) | u];
+          const gm = wL * wR + (wL + wR);
+          if (gm > s3) { s3 = gm; v3 = u; }
+        }
+      }
+      const has1 = v1 >= 0 && Math.min(co[(bg << 8) | v1], co[(v2 << 8) | v1]) >= 80;
+      const has3 = v3 >= 0 && Math.min(co[(v2 << 8) | v3], co[(fg << 8) | v3]) >= 80;
+      const rampW = directW + co[(bg << 8) | v2] + co[(v2 << 8) | fg]
+        + (has1 ? co[(bg << 8) | v1] + co[(v1 << 8) | v2] : 0)
+        + (has3 ? co[(v2 << 8) | v3] + co[(v3 << 8) | fg] : 0);
+      if (rampW < 2500) continue;
+      if ((has1 || has3) && v1 >= 0 && v3 >= 0) {
+        arms.push({ fg, steps: [v1, v2, v3, fg], score: rampW });
+      } else {
+        arms.push({ fg, steps: [v2, fg], score: rampW });
       }
     }
-    if (bestVals) ramps.push({ bg, vals: bestVals, score: bestScore });
-  }
-  if (ramps.length === 0) return null;
+    arms.sort((a, b) => b.score - a.score);
+    return arms;
+  };
 
-  const buildVariant = (useRamps) => {
-    const totalSlots = useRamps.length * 5;
+  const hubs = [];
+  const usedFgs = new Set();
+  for (const bg of bgs) {
+    if (hubs.length >= 3) break;
+    if (usedFgs.has(bg)) continue;
+    const ex = new Set([bg]);
+    const arms1 = findRampArms(bg, ex);
+    if (!arms1.length) continue;
+    const arm1 = arms1[0];
+    usedFgs.add(arm1.fg);
+    for (const v of arm1.steps) ex.add(v);
+    let arm2 = null;
+    if (!isPhoto) {
+      const arms2 = findRampArms(bg, ex);
+      if (arms2.length && arms2[0].score >= 2500) {
+        arm2 = arms2[0];
+        usedFgs.add(arm2.fg);
+      }
+    }
+    const seq = [];
+    for (let i = arm1.steps.length - 1; i >= 0; i--) seq.push(arm1.steps[i]);
+    seq.push(bg);
+    if (arm2) for (let i = 0; i < arm2.steps.length; i++) seq.push(arm2.steps[i]);
+    hubs.push({ bg, seq, score: arm1.score + (arm2 ? arm2.score : 0) });
+  }
+  if (hubs.length === 0) return null;
+
+  const buildVariant = (useHubs, compact, guard) => {
+    let totalSlots = 0;
+    for (const h of useHubs) totalSlots += h.seq.length;
+    if (totalSlots > freeCnt) return null;
     let plteLen = 256;
     const plteVal = new Uint8Array(256);
     const canon = new Uint8Array(256);
     let bestBase = 0;
 
-    if (minUsed >= totalSlots) {
-      // Shift minUsed..maxUsed down to totalSlots.. so all photo diffs stay 100% identical AND PLTE trims trailing unused slots!
+    if (compact) {
+      if (totalSlots + usedVals.length > 256) return null;
+      plteLen = totalSlots + usedVals.length;
+      for (let i = 0; i < usedVals.length; i++) {
+        const g = usedVals[i];
+        plteVal[totalSlots + i] = g;
+        canon[g] = totalSlots + i;
+      }
+      bestBase = 0;
+    } else if (minUsed >= totalSlots) {
       const shift = minUsed - totalSlots;
       plteLen = maxUsed - shift + 1;
       for (let g = minUsed; g <= maxUsed; g++) {
@@ -245,7 +289,7 @@ function buildAutoGreyDup(pix, width, height, maxRamps = 2) {
         for (let k = 0; k < totalSlots; k++) if (used[b + k]) c += cnt[b + k];
         if (c < bestCost) { bestCost = c; bestBase = b; if (c === 0) break; }
       }
-      if (bestCost > 200) return null;
+      if (bestCost > 400) return null;
       for (let i = 0; i < 256; i++) { plteVal[i] = i; canon[i] = i; }
       let fi = 0;
       for (let k = 0; k < totalSlots; k++) {
@@ -268,18 +312,17 @@ function buildAutoGreyDup(pix, width, height, maxRamps = 2) {
     const seen = new Uint8Array(n);
     let curSlot = bestBase;
 
-    for (const r of useRamps) {
-      const bg = r.bg;
-      const inR = new Int16Array(256).fill(-1);
-      for (let k = 0; k < 5; k++) { plteVal[curSlot] = r.vals[k]; inR[r.vals[k]] = curSlot++; }
+    for (const h of useHubs) {
+      const bg = h.bg;
+      const inH = new Int16Array(256).fill(-1);
+      for (let k = 0; k < h.seq.length; k++) { plteVal[curSlot] = h.seq[k]; inH[h.seq[k]] = curSlot++; }
       seen.fill(0);
       let qh = 0, qt = 0;
       for (let y = 1; y < height - 1; y++) {
         const o = y * width;
         for (let x = 1; x < width - 1; x++) {
           const i = o + x;
-          if (claimed[i]) continue;
-          if (pix[i] === bg && pix[i - 1] === bg && pix[i + 1] === bg && pix[i - width] === bg && pix[i + width] === bg) {
+          if (!claimed[i] && pix[i] === bg && pix[i - 1] === bg && pix[i + 1] === bg && pix[i - width] === bg && pix[i + width] === bg) {
             seen[i] = 1;
             q[qt++] = i;
           }
@@ -289,77 +332,123 @@ function buildAutoGreyDup(pix, width, height, maxRamps = 2) {
         const i = q[qh++];
         if (claimed[i]) continue;
         claimed[i] = 1;
-        enc[i] = inR[pix[i]];
+        enc[i] = inH[pix[i]];
         const x = i % width, y = (i / width) | 0;
         if (x > 0) {
           const ni = i - 1;
-          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
-            const g = pix[ni], nx = x - 1;
-            if (!((nx > 0 && inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
-              || (inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
-              || (y > 0 && inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
-              || (y + 1 < height && inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
-              seen[ni] = 1; q[qt++] = ni;
+          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
+            let ok = true;
+            if (guard >= 0) {
+              const g = pix[ni], nx = x - 1;
+              if ((nx > 0 && inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
+                || (inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
+                || (y > 0 && inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
+                || (y + 1 < height && inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
             }
+            if (ok) { seen[ni] = 1; q[qt++] = ni; }
           }
         }
         if (x + 1 < width) {
           const ni = i + 1;
-          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
-            const g = pix[ni], nx = x + 1;
-            if (!((inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
-              || (nx + 1 < width && inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
-              || (y > 0 && inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
-              || (y + 1 < height && inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
-              seen[ni] = 1; q[qt++] = ni;
+          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
+            let ok = true;
+            if (guard >= 0) {
+              const g = pix[ni], nx = x + 1;
+              if ((inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
+                || (nx + 1 < width && inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
+                || (y > 0 && inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
+                || (y + 1 < height && inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
             }
+            if (ok) { seen[ni] = 1; q[qt++] = ni; }
           }
         }
         if (y > 0) {
           const ni = i - width;
-          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
-            const g = pix[ni], ny = y - 1;
-            if (!((x > 0 && inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
-              || (x + 1 < width && inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
-              || (ny > 0 && inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
-              || (inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
-              seen[ni] = 1; q[qt++] = ni;
+          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
+            let ok = true;
+            if (guard >= 0) {
+              const g = pix[ni], ny = y - 1;
+              if ((x > 0 && inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
+                || (x + 1 < width && inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
+                || (ny > 0 && inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
+                || (inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
             }
+            if (ok) { seen[ni] = 1; q[qt++] = ni; }
           }
         }
         if (y + 1 < height) {
           const ni = i + width;
-          if (!seen[ni] && !claimed[ni] && inR[pix[ni]] >= 0) {
-            const g = pix[ni], ny = y + 1;
-            if (!((x > 0 && inR[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= 6)
-              || (x + 1 < width && inR[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= 6)
-              || (inR[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= 6)
-              || (ny + 1 < height && inR[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= 6))) {
-              seen[ni] = 1; q[qt++] = ni;
+          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
+            let ok = true;
+            if (guard >= 0) {
+              const g = pix[ni], ny = y + 1;
+              if ((x > 0 && inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
+                || (x + 1 < width && inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
+                || (inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
+                || (ny + 1 < height && inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
             }
+            if (ok) { seen[ni] = 1; q[qt++] = ni; }
           }
         }
       }
     }
 
-    // Strict lossless verification before returning
     for (let i = 0; i < n; i++) if (plteVal[enc[i]] !== pix[i]) return null;
     const plte = new Uint8Array(plteLen * 3);
     for (let i = 0; i < plteLen; i++) {
       const v = plteVal[i];
       plte[i * 3] = v; plte[i * 3 + 1] = v; plte[i * 3 + 2] = v;
     }
-    return { colourType: 3, bpp: 1, samples: enc, plte, trns: null };
+    return { colourType: 3, bpp: 1, samples: enc, plte, trns: null, canon, origPix: pix };
   };
 
   const cands = [];
-  const v1 = buildVariant(ramps.slice(0, 1));
-  if (v1) cands.push(v1);
-  if (ramps.length >= 2) {
-    const v2 = buildVariant(ramps.slice(0, 2));
-    if (v2) cands.push(v2);
+  if (isPhoto) {
+    const v1 = buildVariant(hubs.slice(0, 1), false, 6);
+    if (v1) cands.push(v1);
+    if (hubs.length >= 2) {
+      const v2 = buildVariant(hubs.slice(0, 2), false, 6);
+      if (v2) cands.push(v2);
+    }
+  } else {
+    const useN = Math.min(2, hubs.length);
+    const vc = buildVariant(hubs.slice(0, useN), true, -1);
+    if (vc) cands.push(vc);
+    const vf = buildVariant(hubs.slice(0, useN), false, -1);
+    if (vf) cands.push(vf);
+    if (hubs.length >= 3) {
+      const vc3 = buildVariant(hubs.slice(0, 3), true, -1);
+      if (vc3) cands.push(vc3);
+    }
+    if (cands.length === 0) {
+      const v1 = buildVariant(hubs.slice(0, 1), true, -1) || buildVariant(hubs.slice(0, 1), false, -1);
+      if (v1) cands.push(v1);
+    }
   }
   return cands.length ? cands : null;
+}
+
+/** Revert shadow-PLTE indices back to canonical indices on f=0 rows whose next row is f=0 or f=1. */
+function buildF0RevertedRaw(enc, origPix, canon, types, width, height, rowLen) {
+  const enc2 = enc.slice();
+  let changed = false;
+  for (let y = 0; y < height; y++) {
+    if (types[y] === 0 && (y + 1 === height || types[y + 1] === 0 || types[y + 1] === 1)) {
+      const o = y * width;
+      for (let x = 0; x < width; x++) {
+        const cv = canon[origPix[o + x]];
+        if (enc2[o + x] !== cv) { enc2[o + x] = cv; changed = true; }
+      }
+    }
+  }
+  if (!changed) return null;
+  const raw = new Uint8Array(height * rowLen);
+  for (let y = 0; y < height; y++) {
+    const at = y * rowLen;
+    raw[at] = types[y];
+    filterRow(types[y], enc2.subarray(y * width, (y + 1) * width), y ? enc2.subarray((y - 1) * width, y * width) : null, 1, raw.subarray(at + 1, at + rowLen));
+  }
+  return raw;
 }
 
 function bruteRow(fRows, height, rowLen, level, bias) {
@@ -371,7 +460,7 @@ function bruteRow(fRows, height, rowLen, level, bias) {
     let best = Infinity, bt = 0;
     for (let t = 0; t < 5; t++) {
       const row = fRows[t].subarray(at, at + rowLen);
-      let c = deflateSync(row, dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 }).length;
+      let c = deflateSync(row, dict.length ? { level, memLevel: 5, dictionary: dict } : { level, memLevel: 5 }).length;
       if (bias && y > 0 && t === types[y - 1]) c -= bias;
       if (c < best) { best = c; bt = t; }
     }
@@ -404,7 +493,7 @@ function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allo
   };
 
   const scoreView = (view, dict) => {
-    const base = dict && dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 };
+    const base = dict && dict.length ? { level, memLevel: 5, dictionary: dict } : { level, memLevel: 5 };
     if (strategy !== -1) return deflateSync(view, { ...base, strategy }).length;
     return Math.min(
       deflateSync(view, { ...base, strategy: 0 }).length,
@@ -497,7 +586,7 @@ function snapTransitions(fRows, height, rowLen, types, level = 4, strategy = 0) 
         const ft = y < sp ? (y < minY ? out[y] : tL) : (y >= maxY ? out[y] : tR);
         winBuf.set(fRows[ft].subarray(y * rowLen, (y + 1) * rowLen), (y - winStart) * rowLen);
       }
-      const base = dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 };
+      const base = dict.length ? { level, memLevel: 5, dictionary: dict } : { level, memLevel: 5 };
       if (strategy !== -1) return deflateSync(winBuf, { ...base, strategy }).length;
       return Math.min(
         deflateSync(winBuf, { ...base, strategy: 0 }).length,
@@ -552,7 +641,7 @@ function recombine2Cuts(fRows, height, rowLen, planA, planB, cuts, level = 5, st
       target.set(ch, 0);
       target.set(lk, ch.length);
     }
-    const base = dict && dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 };
+    const base = dict && dict.length ? { level, memLevel: 5, dictionary: dict } : { level, memLevel: 5 };
     if (strat !== -1) return deflateSync(target, { ...base, strategy: strat }).length;
     return Math.min(
       deflateSync(target, { ...base, strategy: 0 }).length,
@@ -609,12 +698,12 @@ function fixedCuts(height, band) {
   return c;
 }
 
-/** Centered L6 Transition + Row Post-Filter (evaluates downstream dictionary impact at level 6). */
+/** Centered L5 Transition + Row Post-Filter (evaluates downstream dictionary impact at level 5, memLevel 5). */
 function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
   const out = types.slice();
-  const maxWin = Math.max(4, Math.min(20, Math.floor(32768 / rowLen)));
+  const maxWin = Math.max(4, Math.min(14, Math.floor(32768 / rowLen)));
   const backRows = maxWin;
-  const fwdRows = bpp === 1 ? Math.min(16, maxWin) : maxWin;
+  const fwdRows = bpp === 1 ? Math.min(14, maxWin) : maxWin;
   const buf = new Uint8Array((backRows + fwdRows + 4) * rowLen);
 
   const scoreRange = (yA, yB, fCand) => {
@@ -627,24 +716,24 @@ function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
     }
     const dict = dRows > 0 ? buf.subarray(0, dRows * rowLen) : null;
     const body = buf.subarray(dRows * rowLen, (y1 - y0) * rowLen);
-    const base = dict ? { level: 6, memLevel: 7, strategy: 0, dictionary: dict } : { level: 6, memLevel: 7, strategy: 0 };
+    const base = dict ? { level: 5, memLevel: 5, strategy: 0, dictionary: dict } : { level: 5, memLevel: 5, strategy: 0 };
     return deflateSync(body, base).length;
   };
 
-  // Pass 1: Transition L6 Polish (up to +-10 rows)
+  // Pass 1: Transition L5 Polish (up to +-8 rows)
   for (let pass = 0; pass < 2; pass++) {
     let mv = 0;
     for (let y = 1; y < height; y++) {
       if (out[y] === out[y - 1]) continue;
       const fL = out[y - 1], fR = out[y];
       let cur = y, steps = 0;
-      while (cur < height && out[cur] === fR && steps < 10) {
+      while (cur < height && out[cur] === fR && steps < 8) {
         if (scoreRange(cur, cur + 1, fL) < scoreRange(cur, cur + 1, fR)) { out[cur] = fL; cur++; steps++; mv++; }
         else break;
       }
       if (steps > 0) { y = cur; continue; }
       cur = y - 1; steps = 0;
-      while (cur >= 0 && out[cur] === fL && steps < 10) {
+      while (cur >= 0 && out[cur] === fL && steps < 8) {
         if (scoreRange(cur, cur + 1, fR) < scoreRange(cur, cur + 1, fL)) { out[cur] = fR; cur--; steps++; mv++; }
         else break;
       }
@@ -652,8 +741,9 @@ function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
     if (!mv) break;
   }
 
-  // Pass 2: 1-pass Centered L6 Row Post-Filter (skips flat rows; pre-ranks {1,3,4} by residual sum to avoid redundant zlib calls)
-  const margin = bpp === 1 ? 1 : 0;
+  // Pass 2: 1-pass Centered L5 Row Post-Filter on 1-bpp (multi-bpp keeps fast Pass 1 transition polish only)
+  if (bpp > 1) return out;
+  const margin = 1;
   const allZero = info ? info.allZero : null;
   const dup = info ? info.dup : null;
   for (let y = 0; y < height; y++) {
@@ -703,6 +793,7 @@ function screen(rgba, width, height) {
       z,
       size: sz + chunkOverhead(form),
       isPhoto,
+      dupMeta: form.canon ? { enc: form.samples, origPix: form.origPix, canon: form.canon } : null,
     });
   };
 
@@ -779,18 +870,92 @@ function screen(rgba, width, height) {
     push('f0', form, fRows, rowLen, f0, isPhoto, info);
     push('f0+su2', form, fRows, rowLen, smartUpOverlay(f0, info, 2, 1), isPhoto, info);
 
+    // Check Auto-detected Affine Anti-Aliased Multi-Hub Shadow-PLTE (CT 3) FIRST on opaque greyscale!
+    // When it strongly wins, we skip redundant CT 0 search passes (saving ~3.5s on greyscale images!).
+    let strongGreyDup = false;
+    let v8 = null, z8 = Infinity;
+    if (grey && opaque && ct === 0) {
+      const dupForms = buildAutoMultiHubGrey(form.samples, width, height, isPhoto);
+      if (dupForms) {
+        const z2Base = deflateSync(fRows[2], Z6).length;
+        let bestDup = null, bestDupScore = Infinity;
+        for (const df of dupForms) {
+          const f2Row = new Uint8Array(height * rowLen);
+          for (let y = 0; y < height; y++) {
+            const at = y * rowLen;
+            f2Row[at] = 2;
+            filterRow(2, df.samples.subarray(y * width, (y + 1) * width), y ? df.samples.subarray((y - 1) * width, y * width) : null, 1, f2Row.subarray(at + 1, at + rowLen));
+          }
+          const z2Idat = deflateSync(f2Row, Z6).length;
+          const z2Tot = z2Idat + chunkOverhead(df);
+          const cmpScore = !isPhoto ? z2Tot - (256 - df.plte.length / 3) * 2 : z2Tot;
+          const ok = isPhoto ? (z2Tot < z2Base - 250) : (z2Idat < z2Base - 300 || z2Tot < z2Base + 1500);
+          if (ok && cmpScore < bestDupScore) { bestDupScore = cmpScore; bestDup = df; }
+        }
+        if (bestDup) {
+          const dRows = precomputeFilteredRows(bestDup.samples, width, height, 1);
+          const dInfo = analyzeRows(bestDup.samples, width, height, 1);
+          const pushDup = (name, types) => {
+            const revRaw = buildF0RevertedRaw(bestDup.samples, bestDup.origPix, bestDup.canon, types, width, height, rowLen);
+            if (revRaw) {
+              const z0 = deflateSync(revRaw, Z6);
+              let z = z0, sz = z0.length;
+              if (isPhoto) {
+                const z1 = deflateSync(revRaw, Z6F);
+                if (z1.length < sz) { z = z1; sz = z1.length; }
+              }
+              const rawBase = assembleFromFRows(dRows, height, rowLen, types);
+              const zb = deflateSync(rawBase, isPhoto ? Z6F : Z6);
+              if (sz <= zb.length) {
+                rawCands.push({
+                  name: name + '+rev0',
+                  form: { colourType: bestDup.colourType, bpp: bestDup.bpp, plte: bestDup.plte, trns: bestDup.trns },
+                  rowLen, raw: revRaw, fRows: dRows, types, info: dInfo, z,
+                  size: sz + chunkOverhead(bestDup), isPhoto,
+                  dupMeta: { enc: bestDup.samples, origPix: bestDup.origPix, canon: bestDup.canon },
+                });
+                return sz + chunkOverhead(bestDup);
+              }
+            }
+            push(name, bestDup, dRows, rowLen, types, isPhoto, dInfo);
+            return rawCands[rawCands.length - 1].size;
+          };
+          if (isPhoto) {
+            const dBr = bruteRow(dRows, height, rowLen, z4min > 125000 ? 3 : 4, 2);
+            const sBr = pushDup('gdup_brute4', dBr);
+            pushDup('gdup_brute4+su2', smartUpOverlay(dBr, dInfo, 2, 1));
+            const dV8 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 8), 5, judgeStrat, [0, 1, 2, 3, 4], 15);
+            const dV8s = snapTransitions(dRows, height, rowLen, dV8, 4, judgeStrat);
+            pushDup('gdup_vit8+snap', dV8s);
+            const dRec = recombine2(dRows, height, rowLen, dBr, dV8s, 16, z4min > 120000 ? 4 : 5, -1, 0);
+            const sRec = pushDup('gdup_rec_br_v8', dRec);
+            if (Math.min(sBr, sRec) < z2Base - 600) strongGreyDup = true;
+          } else {
+            // Run CT 0 vit8 first (~0.3s) so we only skip remaining CT 0 passes when shadow-PLTE truly beats CT 0!
+            v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 6, judgeStrat, [0, 1, 2, 3, 4], 0);
+            z8 = deflateSync(assembleFromFRows(fRows, height, rowLen, v8), Z6).length;
+            const dV1 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 1), 5, 0, [0, 1, 2, 3, 4], 4);
+            const sV1 = pushDup('gdup_vit1', dV1);
+            if (sV1 < z8 - 500) strongGreyDup = true;
+          }
+        }
+      }
+    }
+
     let br = null;
-    if (grey) {
+    if (grey && !strongGreyDup) {
       br = bruteRow(fRows, height, rowLen, z4min > 125000 ? 3 : 4, isPhoto ? 2 : 4);
       push('brute4', form, fRows, rowLen, br, isPhoto, info);
       push('brute4+su2', form, fRows, rowLen, smartUpOverlay(br, info, 2, 1), isPhoto, info);
     }
 
-    const v16 = isPhoto ? null : stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 16), 6, judgeStrat);
+    const v16 = (isPhoto || strongGreyDup) ? null : stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 16), 6, judgeStrat);
     const v8Strat = (!grey && isPhoto) ? -1 : judgeStrat;
-    const v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), (heavy || (!grey && isPhoto)) ? 5 : 6, v8Strat, [0, 1, 2, 3, 4], isPhoto ? 15 : 0);
+    if (!v8 && !strongGreyDup) {
+      v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), (heavy || (!grey && isPhoto)) ? 5 : 6, v8Strat, [0, 1, 2, 3, 4], isPhoto ? 15 : 0);
+      z8 = deflateSync(assembleFromFRows(fRows, height, rowLen, v8), isPhoto ? Z6F : Z6).length;
+    }
     const z16 = v16 ? deflateSync(assembleFromFRows(fRows, height, rowLen, v16), isPhoto ? Z6F : Z6).length : Infinity;
-    const z8 = deflateSync(assembleFromFRows(fRows, height, rowLen, v8), isPhoto ? Z6F : Z6).length;
 
     let v16s = null;
     if (v16) {
@@ -800,59 +965,27 @@ function screen(rgba, width, height) {
     }
 
     let v8s = null;
-    if (!heavy || z8 <= z16 * 1.02) {
+    if (v8 && (!heavy || z8 <= z16 * 1.02)) {
       v8s = snapTransitions(fRows, height, rowLen, v8, (!grey && isPhoto) ? 5 : 4, v8Strat);
       push((!grey && isPhoto) ? 'vdual8+snap' : 'vit8+snap', form, fRows, rowLen, v8s, isPhoto, info);
       push((!grey && isPhoto) ? 'vdual8+snap+su' : 'vit8+snap+su', form, fRows, rowLen, smartUpOverlay(v8s, info, 2, 1), isPhoto, info);
     }
 
-    if (grey && !isPhoto && !heavy) {
+    if (grey && !isPhoto && !heavy && !strongGreyDup) {
       const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), 5, 1, [0, 1, 2, 3, 4], 15);
       const v4fs = snapTransitions(fRows, height, rowLen, v4f, 4, 1);
       push('vit4f+snap', form, fRows, rowLen, v4fs, false, info);
       const v2f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 2), 5, 1, [0, 1, 2, 3, 4], 15);
       const v2fs = snapTransitions(fRows, height, rowLen, v2f, 4, 1);
       push('vit2f+snap', form, fRows, rowLen, v2fs, false, info);
-      // Untrapped dual-plan recombination for non-photo grey hybrids (e.g. i008)
       const baseDef = z16 <= z8 ? v16s : (v8s || v16s);
       const recG = recombine2(fRows, height, rowLen, baseDef, v4fs, 16, 5, -1, 0);
       const recGS = snapTransitions(fRows, height, rowLen, recG, 4, 0);
       push('rec_g_def_v4f+snap', form, fRows, rowLen, recGS, false, info);
-    } else if (grey && isPhoto && br) {
+    } else if (grey && isPhoto && br && !strongGreyDup) {
       if (v8s) {
         const recBr = recombine2(fRows, height, rowLen, br, v8s, 16, z4min > 120000 ? 4 : 5, -1, 0);
         push('rec_br_v8', form, fRows, rowLen, recBr, isPhoto, info);
-      }
-    }
-
-    // Auto-detected photo-safe multi-ramp duplicate-palette CT 3 for opaque greyscale (collapses high-contrast AA text ramps into +-1..4!)
-    if (grey && opaque && ct === 0) {
-      const dupForms = buildAutoGreyDup(form.samples, width, height, 2);
-      if (dupForms) {
-        const z2Base = deflateSync(fRows[2], Z6).length;
-        let bestDup = null, bestDupZ2 = z2Base - 300;
-        for (const df of dupForms) {
-          const f2Row = new Uint8Array(height * rowLen);
-          for (let y = 0; y < height; y++) {
-            const at = y * rowLen;
-            f2Row[at] = 2;
-            filterRow(2, df.samples.subarray(y * width, (y + 1) * width), y ? df.samples.subarray((y - 1) * width, y * width) : null, 1, f2Row.subarray(at + 1, at + rowLen));
-          }
-          const z2D = deflateSync(f2Row, Z6).length + chunkOverhead(df);
-          if (z2D < bestDupZ2) { bestDupZ2 = z2D; bestDup = df; }
-        }
-        if (bestDup) {
-          const dRows = precomputeFilteredRows(bestDup.samples, width, height, 1);
-          const dInfo = analyzeRows(bestDup.samples, width, height, 1);
-          const dBr = bruteRow(dRows, height, rowLen, z4min > 125000 ? 3 : 4, isPhoto ? 2 : 4);
-          push('gdup_brute4', bestDup, dRows, rowLen, dBr, isPhoto, dInfo);
-          push('gdup_brute4+su2', bestDup, dRows, rowLen, smartUpOverlay(dBr, dInfo, 2, 1), isPhoto, dInfo);
-          const dV8 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 8), 5, judgeStrat, [0, 1, 2, 3, 4], isPhoto ? 15 : 0);
-          const dV8s = snapTransitions(dRows, height, rowLen, dV8, 4, judgeStrat);
-          push('gdup_vit8+snap', bestDup, dRows, rowLen, dV8s, isPhoto, dInfo);
-          const dRec = recombine2(dRows, height, rowLen, dBr, dV8s, 16, z4min > 120000 ? 4 : 5, -1, 0);
-          push('gdup_rec_br_v8', bestDup, dRows, rowLen, dRec, isPhoto, dInfo);
-        }
       }
     }
 
@@ -919,7 +1052,9 @@ function screen(rgba, width, height) {
       }
     }
   } else if (grey) {
-    const musts = rawCands[0].isPhoto ? ['gdup_brute4', 'gdup_rec_br_v8', 'rec_br_v8'] : ['rec_g_def_v4f+snap', 'vit4f+snap', 'vit2f+snap'];
+    const musts = rawCands[0].isPhoto
+      ? ['gdup_brute4', 'gdup_brute4+rev0', 'gdup_rec_br_v8', 'rec_br_v8']
+      : ['gdup_vit1+rev0', 'gdup_vit1', 'gdup_vit2+rev0', 'rec_g_def_v4f+snap', 'vit4f+snap'];
     for (const must of musts) {
       const found = rawCands.find((c) => c.name === must);
       if (found && !seenFamily.has(baseOf(must)) && addCand(found)) seenFamily.add(baseOf(must));
@@ -933,15 +1068,16 @@ function screen(rgba, width, height) {
   }
   topK.sort((a, b) => a.size - b.size);
 
-  // Run Centered L6 Post-Filter right here while fRows is live, then immediately drop fRows to keep RSS < 250 MB!
+  // Run Centered L5 Post-Filter right here while fRows is live, then immediately drop fRows to keep RSS < 250 MB!
   let keepCands;
   if (topK[0].form.bpp > 1) {
     let best = topK[0];
-    if (!best.isPhoto && best.fRows && best.types) {
+    if (!best.isPhoto && best.size < 100000 && best.fRows && best.types) {
       let f0Cnt = 0;
       for (let y = 0; y < height; y++) if (best.types[y] === 0) f0Cnt++;
       if (f0Cnt < height * 0.85) {
-        const polTypes = centeredPostFilterL6(best.fRows, height, best.rowLen, best.types, best.form.bpp, best.info);
+        const postInfo = best.info ? { ...best.info, heavyPost: best.size >= 65000 } : { heavyPost: best.size >= 65000 };
+        const polTypes = centeredPostFilterL6(best.fRows, height, best.rowLen, best.types, best.form.bpp, postInfo);
         const polRaw = assembleFromFRows(best.fRows, height, best.rowLen, polTypes);
         const zP = deflateSync(polRaw, Z8);
         if (zP.length + chunkOverhead(best.form) < best.size) {
@@ -952,14 +1088,18 @@ function screen(rgba, width, height) {
     keepCands = [{ name: best.name, form: best.form, rowLen: best.rowLen, raw: best.raw, z: best.z, size: best.size, isPhoto: best.isPhoto }];
   } else {
     // 1-bpp: keep samples reference only for non-photo grey (0.9 MB) so Phase 2 can post-filter the PS winner without holding 5x fRows!
-    const keepGreySamples = (!topK[0].isPhoto && topK[0].form.colourType === 0) ? topK[0].fRows[0] : null;
+    const keepGrey = grey && !topK[0].isPhoto;
     keepCands = topK.map((c) => ({
-      name: c.name, form: c.form, rowLen: c.rowLen, raw: c.raw, types: keepGreySamples ? c.types : null,
-      info: keepGreySamples ? c.info : null, z: c.z, size: c.size, isPhoto: c.isPhoto,
+      name: c.name, form: c.form, rowLen: c.rowLen, raw: c.raw,
+      types: keepGrey ? c.types : null,
+      info: keepGrey ? c.info : null,
+      f0Ref: keepGrey && c.fRows ? c.fRows[0] : null,
+      dupMeta: keepGrey ? (c.dupMeta || null) : null,
+      z: c.z, size: c.size, isPhoto: c.isPhoto,
     }));
-    return { cands: keepCands, best: keepCands[0], width, height, greyF0: keepGreySamples };
+    return { cands: keepCands, best: keepCands[0], width, height };
   }
-  return { cands: keepCands, best: keepCands[0], width, height, greyF0: null };
+  return { cands: keepCands, best: keepCands[0], width, height };
 }
 
 function encodeCand(c, width, height, settings) {
@@ -1013,12 +1153,12 @@ function encodeCand(c, width, height, settings) {
 
 // Deterministic byte-counted work budget (never reads wall clock).
 const DEF_1BPP_SM = { cut: 320, hc3Cut: 24, hc4Cut: 64, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 1, passes: 2, minSyms: 64,  initChunks: 185, dpCap: 56, blockAltBasin: true };
-const DEF_1BPP    = { cut: 224, hc3Cut: 16, hc4Cut: 48, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 1, passes: 2, minSyms: 128, initChunks: 165, dpCap: 50, blockAltBasin: true };
-const DEF_NORM    = { cut: 224, hc3Cut: 0,  hc4Cut: 10, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 155, dpCap: 48, blockAltBasin: true };
-const DEF_PHOTO   = { cut: 224, hc3Cut: 0,  hc4Cut: 16, nice: 259, iters: 2, blockIters: 2, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 155, dpCap: 48, blockAltBasin: true };
-const DEF_LIGHT   = { cut: 144, hc3Cut: 0,  hc4Cut: 8,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 135, dpCap: 40, blockAltBasin: false };
+const DEF_1BPP    = { cut: 208, hc3Cut: 12, hc4Cut: 36, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 128, initChunks: 155, dpCap: 46, blockAltBasin: true };
+const DEF_NORM    = { cut: 160, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 145, dpCap: 42, blockAltBasin: false };
+const DEF_PHOTO   = { cut: 144, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 140, dpCap: 40, blockAltBasin: false };
+const DEF_LIGHT   = { cut: 128, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 130, dpCap: 38, blockAltBasin: false };
 
-const BUDGET = 14200;
+const BUDGET = 14800;
 const oneCost = (c) => 0.35 * (c.raw.length / 1024) + 12.0 * (c.size / 1024);
 
 // Phase 1: screen every image and immediately write verified zlib PNG so every instance holds a valid answer.
@@ -1058,8 +1198,8 @@ for (const id of [...screened.keys()]) {
     // Fast WASM pre-screen on 1-bpp non-photo images (eliminates zlib bias on palette & grey hybrids)
     let chosen = s.best;
     if (!isLight && bpp === 1 && !s.best.isPhoto && s.cands.length > 1) {
-      const maxPool = 4;
-      const pool = s.cands.filter((c, i) => i === 0 || (i < maxPool && c.size <= s.best.size * 1.04));
+      const maxPool = 3;
+      const pool = s.cands.filter((c, i) => i === 0 || (i < maxPool && c.size <= s.best.size * 1.03));
       if (pool.length > 1) {
         const ranked = pool.map((c) => ({
           c,
@@ -1070,15 +1210,22 @@ for (const id of [...screened.keys()]) {
       }
     }
 
-    // Centered L6 Post-Filter on non-photo grey winner (reconstruct 1-bpp samples from greyF0 in ~15 ms)
-    if (!isLight && s.greyF0 && chosen.types) {
+    // Centered L5 Post-Filter on non-photo CT 0 grey winner (skip for gdup_vit1 which already ran exact 1-row Viterbi!)
+    if (!isLight && chosen.f0Ref && chosen.types && !chosen.dupMeta) {
       const samples = new Uint8Array(s.width * s.height);
       const rl = s.width + 1;
-      for (let y = 0; y < s.height; y++) samples.set(s.greyF0.subarray(y * rl + 1, (y + 1) * rl), y * s.width);
+      for (let y = 0; y < s.height; y++) samples.set(chosen.f0Ref.subarray(y * rl + 1, (y + 1) * rl), y * s.width);
       const fRows = precomputeFilteredRows(samples, s.width, s.height, 1, [0, 1, 2, 3, 4]);
       const polTypes = centeredPostFilterL6(fRows, s.height, chosen.rowLen, chosen.types, 1, chosen.info);
-      const polRaw = assembleFromFRows(fRows, s.height, chosen.rowLen, polTypes);
-      const zP = deflateSync(polRaw, Z8);
+      let polRaw = assembleFromFRows(fRows, s.height, chosen.rowLen, polTypes);
+      let zP = deflateSync(polRaw, Z8);
+      if (chosen.dupMeta) {
+        const revRaw = buildF0RevertedRaw(chosen.dupMeta.enc, chosen.dupMeta.origPix, chosen.dupMeta.canon, polTypes, s.width, s.height, chosen.rowLen);
+        if (revRaw) {
+          const zR = deflateSync(revRaw, Z8);
+          if (zR.length < zP.length) { polRaw = revRaw; zP = zR; }
+        }
+      }
       if (zP.length + chunkOverhead(chosen.form) < chosen.size) {
         chosen = { ...chosen, raw: polRaw, z: zP, size: zP.length + chunkOverhead(chosen.form) };
       }

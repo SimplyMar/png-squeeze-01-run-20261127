@@ -1496,30 +1496,16 @@ export function deflateRawWasm(data, opts = {}) {
 export function estimateDeflateBytes(data, bpp = 1, rowLen = 0, isPhoto = false) {
   const n = data.length;
   const eng = getWasmEngine();
-  const L = eng.prepareMatches(data, 20, 259, bpp, rowLen, 0, 0);
+  const L = eng.prepareMatches(data, 12, 259, bpp, rowLen, 0, 0);
   const gL = new Uint16Array(n + 1);
   const gD = new Uint16Array(n + 1);
 
   if (isPhoto) costsFromLitHeavy(data, 0, n);
   else costsFromFixed(0);
-  let bestM = eng.parseRange(L, 0, n, litCostI32, lenCostI32, distCostI32, gL, gD, 0, bpp);
-  if (bpp === 1) {
-    const tL = new Uint16Array(n + 1);
-    const tD = new Uint16Array(n + 1);
-    let bestB = blockBits(gL, gD, 0, bestM, false);
-    histogram(gL, gD, 0, bestM);
-    costsFromCounts(llC, dC);
-    const m2 = eng.parseRange(L, 0, n, litCostI32, lenCostI32, distCostI32, tL, tD, 0, bpp);
-    const b2 = blockBits(tL, tD, 0, m2, false);
-    if (b2 < bestB) {
-      gL.set(tL.subarray(0, m2));
-      gD.set(tD.subarray(0, m2));
-      bestM = m2;
-    }
-  }
+  const bestM = eng.parseRange(L, 0, n, litCostI32, lenCostI32, distCostI32, gL, gD, 0, bpp);
 
   // Fast bottom-up split without boundary slide -> accurate block-split byte estimate!
-  const sp = splitHybridDP(data, rowLen, gL, gD, bestM, 256, 200, 56, 0, true);
+  const sp = splitHybridDP(data, rowLen, gL, gD, bestM, 256, 200, 44, 0, true);
   const symB = [0, ...sp, bestM];
   let totalBits = 0;
   for (let b = 0; b + 1 < symB.length; b++) {
