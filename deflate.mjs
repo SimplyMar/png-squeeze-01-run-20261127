@@ -660,14 +660,17 @@ function splitHybridDP(data, rowLen, lit, dist, m, minSyms = 256, maxBlocks = 20
     segs.push({ a, b, ll, d, extra, bits });
   }
 
-  // Stage 1a: Clone segments for pure greedy bottom-up merge (proven safeguard on small/uniform streams)
-  const buSegs = segs.map((s) => ({ a: s.a, b: s.b, ll: s.ll.slice(), d: s.d.slice(), extra: s.extra, bits: s.bits }));
+  // Stage 1: Single bottom-up greedy merge pass; snapshot segments at length === dpCap for Stage 2 Exact O(M^2) DP!
+  const buSegs = segs;
+  let dpSegs = (dpCap > 0 && buSegs.length <= dpCap)
+    ? buSegs.map((s) => ({ a: s.a, b: s.b, ll: s.ll.slice(), d: s.d.slice(), extra: s.extra, bits: s.bits }))
+    : null;
   const buGains = [];
   for (let i = 0; i + 1 < buSegs.length; i++) buGains.push(buSegs[i].bits + buSegs[i + 1].bits - combinedHistBits(buSegs[i], buSegs[i + 1]));
   while (buSegs.length > 1) {
     let bestI = -1, bestG = -Infinity;
     for (let i = 0; i < buGains.length; i++) if (buGains[i] > bestG) { bestG = buGains[i]; bestI = i; }
-    if (bestI < 0 || (bestG <= 0 && buSegs.length <= maxBlocks)) break;
+    if (bestI < 0 || (bestG <= 0 && buSegs.length <= maxBlocks && (dpCap <= 0 || dpSegs !== null))) break;
     const s1 = buSegs[bestI], s2 = buSegs[bestI + 1];
     for (let k = 0; k < 288; k++) s1.ll[k] += s2.ll[k];
     s1.ll[256] = 1;
@@ -679,50 +682,27 @@ function splitHybridDP(data, rowLen, lit, dist, m, minSyms = 256, maxBlocks = 20
     buGains.splice(bestI, 1);
     if (bestI > 0) buGains[bestI - 1] = buSegs[bestI - 1].bits + buSegs[bestI].bits - combinedHistBits(buSegs[bestI - 1], buSegs[bestI]);
     if (bestI < buSegs.length - 1) buGains[bestI] = buSegs[bestI].bits + buSegs[bestI + 1].bits - combinedHistBits(buSegs[bestI], buSegs[bestI + 1]);
+    if (dpCap > 0 && dpSegs === null && buSegs.length <= dpCap) {
+      dpSegs = buSegs.map((s) => ({ a: s.a, b: s.b, ll: s.ll.slice(), d: s.d.slice(), extra: s.extra, bits: s.bits }));
+    }
   }
   let buBits = 0;
   for (const s of buSegs) buBits += s.bits;
 
   let chosen;
-  if (dpCap <= 0) {
+  if (dpCap <= 0 || !dpSegs) {
     chosen = buSegs.map((s) => ({ a: s.a, b: s.b, bits: s.bits }));
   } else {
-    // Stage 1b: Agglomerative coarsening down to <= dpCap segments, then Exact O(M^2) DP!
-    if (segs.length > dpCap) {
-      const gains = [];
-      for (let i = 0; i + 1 < segs.length; i++) {
-        gains.push(segs[i].bits + segs[i + 1].bits - combinedHistBits(segs[i], segs[i + 1]));
-      }
-      while (segs.length > dpCap) {
-        let bestI = -1, bestG = -Infinity;
-        for (let i = 0; i < gains.length; i++) {
-          if (gains[i] > bestG) { bestG = gains[i]; bestI = i; }
-        }
-        if (bestI < 0) break;
-        const s1 = segs[bestI], s2 = segs[bestI + 1];
-        for (let k = 0; k < 288; k++) s1.ll[k] += s2.ll[k];
-        s1.ll[256] = 1;
-        for (let k = 0; k < 30; k++) s1.d[k] += s2.d[k];
-        s1.extra += s2.extra;
-        s1.b = s2.b;
-        s1.bits = s1.bits + s2.bits - bestG;
-        segs.splice(bestI + 1, 1);
-        gains.splice(bestI, 1);
-        if (bestI > 0) gains[bestI - 1] = segs[bestI - 1].bits + segs[bestI].bits - combinedHistBits(segs[bestI - 1], segs[bestI]);
-        if (bestI < segs.length - 1) gains[bestI] = segs[bestI].bits + segs[bestI + 1].bits - combinedHistBits(segs[bestI], segs[bestI + 1]);
-      }
-    }
-
-    const M = segs.length;
+    const M = dpSegs.length;
     const pLL = Array.from({ length: M + 1 }, () => new Int32Array(288));
     const pD = Array.from({ length: M + 1 }, () => new Int32Array(30));
     const pEx = new Int32Array(M + 1);
     for (let i = 0; i < M; i++) {
-      const prevL = pLL[i], nextL = pLL[i + 1], sl = segs[i].ll;
+      const prevL = pLL[i], nextL = pLL[i + 1], sl = dpSegs[i].ll;
       for (let k = 0; k < 288; k++) nextL[k] = prevL[k] + sl[k];
-      const prevD = pD[i], nextD = pD[i + 1], sd = segs[i].d;
+      const prevD = pD[i], nextD = pD[i + 1], sd = dpSegs[i].d;
       for (let k = 0; k < 30; k++) nextD[k] = prevD[k] + sd[k];
-      pEx[i + 1] = pEx[i] + segs[i].extra;
+      pEx[i + 1] = pEx[i] + dpSegs[i].extra;
     }
 
     const dp = new Float64Array(M + 1).fill(Infinity);
@@ -749,7 +729,7 @@ function splitHybridDP(data, rowLen, lit, dist, m, minSyms = 256, maxBlocks = 20
       chosen = [];
       for (let cur = M; cur > 0; cur = par[cur]) {
         const prev = par[cur];
-        chosen.push({ a: segs[prev].a, b: segs[cur - 1].b, bits: dp[cur] - dp[prev] });
+        chosen.push({ a: dpSegs[prev].a, b: dpSegs[cur - 1].b, bits: dp[cur] - dp[prev] });
       }
       chosen.reverse();
     }
@@ -775,7 +755,8 @@ function splitHybridDP(data, rowLen, lit, dist, m, minSyms = 256, maxBlocks = 20
   const sLL = new Int32Array(288), sD = new Int32Array(30);
   const tRLL = new Int32Array(288), tRD = new Int32Array(30);
 
-  for (let sweep = 0; sweep < 2; sweep++) {
+  const maxSweeps = m > 60000 ? 1 : 2;
+  for (let sweep = 0; sweep < maxSweeps; sweep++) {
     let anyMoved = false;
     for (let i = 0; i + 1 < chosen.length; i++) {
     const x = chosen[i].a, y = chosen[i + 1].b;
@@ -1195,7 +1176,7 @@ function splitAndOptimize(eng, L, data, rowLen, bpp, tryDists, baseL, baseD, bas
       bl.set(baseL.subarray(a, z));
       bd.set(baseD.subarray(a, z));
       r = iterateRange(eng, L, data, s, e, bl, bd, z - a, blockIters, huffIters, patience, bpp, tryDists, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
-      if (blockAltBasin && (z - a) >= (bpp === 1 ? 800 : 1800)) {
+      if (blockAltBasin && (z - a) >= (bpp === 1 ? 800 : 2500)) {
         let lits = 0;
         for (let i = 0; i < r.m; i++) if (bd[i] === 0) lits++;
         let altKind = null;
@@ -1210,7 +1191,9 @@ function splitAndOptimize(eng, L, data, rowLen, bpp, tryDists, baseL, baseD, bas
           const bl2 = new Uint16Array(e - s + 1);
           const bd2 = new Uint16Array(e - s + 1);
           const m0 = eng.parseRange(L, s, e, litCostI32, lenCostI32, distCostI32, bl2, bd2, 0, bpp);
-          const r2 = iterateRange(eng, L, data, s, e, bl2, bd2, m0, Math.max(2, blockIters - 1), huffIters, 1, bpp, tryDists, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
+          const altIt = bpp === 1 ? Math.max(2, blockIters - 1) : 1;
+          const altHuff = bpp === 1 ? huffIters : 1;
+          const r2 = iterateRange(eng, L, data, s, e, bl2, bd2, m0, altIt, altHuff, 1, bpp, tryDists, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
           if (r2.bits < r.bits) {
             r = r2;
             bl.set(bl2.subarray(0, r2.m));
@@ -1245,7 +1228,7 @@ function splitAndOptimize(eng, L, data, rowLen, bpp, tryDists, baseL, baseD, bas
         const md = new Uint16Array(be - bs + 1);
         ml.set(outL.subarray(a0, a2));
         md.set(outD.subarray(a0, a2));
-        const rr = iterateRange(eng, L, data, bs, be, ml, md, mLen, 2, 1, 1, bpp, tryDists, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
+        const rr = iterateRange(eng, L, data, bs, be, ml, md, mLen, bpp === 1 ? 2 : 1, bpp === 1 ? 1 : 0, 1, bpp, tryDists, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
         const comb2 = blockBits(ml, md, 0, rr.m, true);
         if (comb2 < comb) {
           const tailLen = starts[starts.length - 1] - a2;
@@ -1290,7 +1273,14 @@ export function deflateRawWasm(data, opts = {}) {
   const dpCap = opts.dpCap ?? 60;
   const passes = opts.passes ?? 2;
   const isPhoto = opts.isPhoto ?? false;
-  const basins = opts.basins ?? (isPhoto ? ['litheavy', 'fixed'] : ['fixed', 'litheavy']);
+  let hasPhotoRows = isPhoto;
+  if (!hasPhotoRows && bpp > 1 && rowLen >= 16 && n >= rowLen * 16) {
+    const h = Math.floor(n / rowLen);
+    let paCnt = 0;
+    for (let y = 0; y < h; y++) { const f = data[y * rowLen]; if (f === 3 || f === 4) paCnt++; }
+    if (paCnt >= h * 0.15) hasPhotoRows = true;
+  }
+  const basins = opts.basins ?? (hasPhotoRows ? (bpp > 1 ? ['litheavy'] : ['litheavy', 'fixed']) : ['fixed', 'litheavy']);
   const blockAltBasin = opts.blockAltBasin ?? true;
 
   const hc3Cut = opts.hc3Cut ?? (bpp === 1 ? 48 : 16);
@@ -1316,8 +1306,8 @@ export function deflateRawWasm(data, opts = {}) {
   for (let bi = 0; bi < basins.length; bi++) {
     const basin = basins[bi];
     let gIt = (bi > 0 || basin === 'pixdist' || (isPhoto && basin === 'fixed')) ? Math.max(1, iters - 1) : iters;
-    let gHuff = basin === 'litheavy' ? 1 : 0;
-    if (basin === 'litheavy' && bpp === 1 && bestM > 0) {
+    let gHuff = (basin === 'litheavy' && bpp === 1) ? 1 : 0;
+    if (basin === 'litheavy' && !isPhoto && bestM > 0) {
       let lits = 0;
       for (let i = 0; i < bestM; i++) if (gD[i] === 0) lits++;
       if (lits < bestM * 0.22) continue;
@@ -1345,7 +1335,7 @@ export function deflateRawWasm(data, opts = {}) {
   };
   let bestSmBits = passes > 1 ? smoothedTotalBits(best) : best.bits;
   for (let p = 1; p < passes; p++) {
-    const p2Iters = Math.max(1, Math.min(2, blockIters - 1));
+    const p2Iters = (bpp === 1 || hasPhotoRows) ? Math.max(1, Math.min(2, blockIters - 1)) : 1;
     const p2Huff = bpp === 1 ? Math.max(1, huffIters - 1) : 0;
     const next = splitAndOptimize(eng, L, data, rowLen, bpp, tryDists, best.lit, best.dist, best.starts[best.starts.length - 1], best.byteMap, best.starts, bestBasin, minSyms, maxBlocks, initChunks, dpCap, p2Iters, p2Huff, 1, false, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
     const nextSmBits = smoothedTotalBits(next);

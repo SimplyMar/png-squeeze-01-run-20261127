@@ -143,12 +143,52 @@ function tspPaletteOrder(rgba, width, height, byCount) {
   return idx.map((i) => byCount[i]);
 }
 
+function computeSmoothMask(pix, width, height) {
+  const n = pix.length;
+  const smooth = new Uint8Array(n);
+  const compId = new Int32Array(n).fill(-1);
+  const q = new Int32Array(n);
+  let cid = 0;
+  for (let i = 0; i < n; i++) {
+    if (compId[i] >= 0) continue;
+    const g = pix[i];
+    let qh = 0, qt = 0;
+    compId[i] = cid; q[qt++] = i;
+    let smEdge = 0, jmpEdge = 0;
+    while (qh < qt) {
+      const cur = q[qh++];
+      const x = cur % width, y = (cur / width) | 0;
+      const check = (ni) => {
+        const ng = pix[ni];
+        if (ng === g) { if (compId[ni] < 0) { compId[ni] = cid; q[qt++] = ni; } }
+        else if (Math.abs(ng - g) <= 3) smEdge++;
+        else jmpEdge++;
+      };
+      if (x > 0) check(cur - 1);
+      if (x + 1 < width) check(cur + 1);
+      if (y > 0) check(cur - width);
+      if (y + 1 < height) check(cur + width);
+    }
+    if (smEdge > 0 && smEdge >= jmpEdge * 2) {
+      for (let k = 0; k < qt; k++) smooth[q[k]] = 1;
+    }
+    cid++;
+  }
+  return smooth;
+}
+
 function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
   const n = pix.length;
+  const smooth = computeSmoothMask(pix, width, height);
   const used = new Uint8Array(256);
   const cnt = new Int32Array(256);
+  const uiCnt = new Int32Array(256);
   const flatCnt = new Int32Array(256);
-  for (let i = 0; i < n; i++) { used[pix[i]] = 1; cnt[pix[i]]++; }
+  for (let i = 0; i < n; i++) {
+    const g = pix[i];
+    used[g] = 1; cnt[g]++;
+    if (!smooth[i]) uiCnt[g]++;
+  }
   const usedVals = [];
   let minUsed = 256, maxUsed = -1;
   for (let i = 0; i < 256; i++) {
@@ -161,25 +201,28 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
   for (let y = 0; y < height; y++) {
     const o = y * width;
     for (let x = 0; x < width; x++) {
-      const g = pix[o + x];
+      const i = o + x;
+      if (smooth[i]) continue;
+      const g = pix[i];
       if (x > 0 && x + 1 < width && y > 0 && y + 1 < height
-        && pix[o + x - 1] === g && pix[o + x + 1] === g && pix[o - width + x] === g && pix[o + width + x] === g) {
+        && !smooth[i - 1] && !smooth[i + 1] && !smooth[i - width] && !smooth[i + width]
+        && pix[i - 1] === g && pix[i + 1] === g && pix[i - width] === g && pix[i + width] === g) {
         flatCnt[g]++;
       }
-      if (x > 0) { const a = pix[o + x - 1]; if (a !== g) { co[(a << 8) | g]++; co[(g << 8) | a]++; } }
-      if (y > 0) { const a = pix[o - width + x]; if (a !== g) { co[(a << 8) | g]++; co[(g << 8) | a]++; } }
+      if (x > 0 && !smooth[i - 1]) { const a = pix[i - 1]; if (a !== g) { co[(a << 8) | g]++; co[(g << 8) | a]++; } }
+      if (y > 0 && !smooth[i - width]) { const a = pix[i - width]; if (a !== g) { co[(a << 8) | g]++; co[(g << 8) | a]++; } }
     }
   }
 
   const bgs = [];
-  for (let g = 0; g < 256; g++) if (flatCnt[g] >= 5000) bgs.push(g);
+  for (let g = 0; g < 256; g++) if (flatCnt[g] >= 4000) bgs.push(g);
   bgs.sort((a, b) => flatCnt[b] - flatCnt[a] || a - b);
 
-  // Chain-balanced geometric-mean affine AA ramp discovery (5-step or 3-step)
+  // Chain-balanced geometric-mean affine AA ramp discovery (5-step or 3-step) on non-smooth UI pixels
   const findRampArms = (bg, excludeSet) => {
     const arms = [];
     for (let fg = 0; fg < 256; fg++) {
-      if (fg === bg || excludeSet.has(fg) || Math.abs(fg - bg) < 32 || cnt[fg] < 400) continue;
+      if (fg === bg || excludeSet.has(fg) || Math.abs(fg - bg) < 28 || uiCnt[fg] < 300) continue;
       const directW = co[(bg << 8) | fg];
       const exp2 = Math.round((bg + fg) / 2);
       let v2 = -1, s2 = 0;
@@ -187,7 +230,7 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
         const v = exp2 + d;
         if (v < 0 || v > 255 || v === bg || v === fg || excludeSet.has(v) || !used[v]) continue;
         const wL = co[(bg << 8) | v], wR = co[(fg << 8) | v];
-        if (wL < 150 || wR < 150) continue;
+        if (wL < 120 || wR < 120) continue;
         const gm = wL * wR;
         if (gm > s2) { s2 = gm; v2 = v; }
       }
@@ -210,12 +253,12 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
           if (gm > s3) { s3 = gm; v3 = u; }
         }
       }
-      const has1 = v1 >= 0 && Math.min(co[(bg << 8) | v1], co[(v2 << 8) | v1]) >= 80;
-      const has3 = v3 >= 0 && Math.min(co[(v2 << 8) | v3], co[(fg << 8) | v3]) >= 80;
+      const has1 = v1 >= 0 && Math.min(co[(bg << 8) | v1], co[(v2 << 8) | v1]) >= 60;
+      const has3 = v3 >= 0 && Math.min(co[(v2 << 8) | v3], co[(fg << 8) | v3]) >= 60;
       const rampW = directW + co[(bg << 8) | v2] + co[(v2 << 8) | fg]
         + (has1 ? co[(bg << 8) | v1] + co[(v1 << 8) | v2] : 0)
         + (has3 ? co[(v2 << 8) | v3] + co[(v3 << 8) | fg] : 0);
-      if (rampW < 2500) continue;
+      if (rampW < 2000) continue;
       if ((has1 || has3) && v1 >= 0 && v3 >= 0) {
         arms.push({ fg, steps: [v1, v2, v3, fg], score: rampW });
       } else {
@@ -228,6 +271,7 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
 
   const hubs = [];
   const usedFgs = new Set();
+  const globalArms = new Map();
   for (const bg of bgs) {
     if (hubs.length >= 3) break;
     if (usedFgs.has(bg)) continue;
@@ -240,33 +284,98 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
     let arm2 = null;
     if (!isPhoto) {
       const arms2 = findRampArms(bg, ex);
-      if (arms2.length && arms2[0].score >= 2500) {
+      if (arms2.length && arms2[0].score >= 2000) {
         arm2 = arms2[0];
         usedFgs.add(arm2.fg);
       }
     }
+    // Align arm orientation across hubs so shared foregrounds produce identical filtered residuals on every hub!
+    let leftArm = arm1, rightArm = arm2;
+    if (arm2) {
+      const s1 = globalArms.get(arm1.fg), s2 = globalArms.get(arm2.fg);
+      if (s1 === 1 || s2 === -1) { leftArm = arm2; rightArm = arm1; }
+      else if (s1 === undefined && s2 === undefined && arm1.fg < arm2.fg) { leftArm = arm2; rightArm = arm1; }
+      globalArms.set(leftArm.fg, -1);
+      globalArms.set(rightArm.fg, 1);
+    } else {
+      globalArms.set(arm1.fg, -1);
+    }
     const seq = [];
-    for (let i = arm1.steps.length - 1; i >= 0; i--) seq.push(arm1.steps[i]);
+    for (let i = leftArm.steps.length - 1; i >= 0; i--) seq.push(leftArm.steps[i]);
     seq.push(bg);
-    if (arm2) for (let i = 0; i < arm2.steps.length; i++) seq.push(arm2.steps[i]);
+    if (rightArm) for (let i = 0; i < rightArm.steps.length; i++) seq.push(rightArm.steps[i]);
     hubs.push({ bg, seq, score: arm1.score + (arm2 ? arm2.score : 0) });
   }
   if (hubs.length === 0) return null;
 
-  const buildVariant = (useHubs, compact, guard) => {
+  const buildVariant = (useHubs, compact) => {
     let totalSlots = 0;
     for (const h of useHubs) totalSlots += h.seq.length;
     if (totalSlots > freeCnt) return null;
+
+    // Claim non-smooth UI pixels per hub first so compact mode can also trim 0-count canonical entries!
+    const claimedSlot = new Int16Array(n).fill(-1);
+    const slotVal = new Uint8Array(totalSlots);
+    const q = new Int32Array(n);
+    const seen = new Uint8Array(n);
+    let curSlot = 0;
+
+    for (const h of useHubs) {
+      const bg = h.bg;
+      const inH = new Int16Array(256).fill(-1);
+      for (let k = 0; k < h.seq.length; k++) { slotVal[curSlot] = h.seq[k]; inH[h.seq[k]] = curSlot++; }
+      seen.fill(0);
+      let qh = 0, qt = 0;
+      for (let y = 1; y < height - 1; y++) {
+        const o = y * width;
+        for (let x = 1; x < width - 1; x++) {
+          const i = o + x;
+          if (!smooth[i] && claimedSlot[i] < 0 && pix[i] === bg && pix[i - 1] === bg && pix[i + 1] === bg && pix[i - width] === bg && pix[i + width] === bg) {
+            seen[i] = 1;
+            q[qt++] = i;
+          }
+        }
+      }
+      while (qh < qt) {
+        const i = q[qh++];
+        if (claimedSlot[i] >= 0) continue;
+        claimedSlot[i] = inH[pix[i]];
+        const x = i % width, y = (i / width) | 0;
+        if (x > 0) {
+          const ni = i - 1;
+          if (!seen[ni] && claimedSlot[ni] < 0 && !smooth[ni] && inH[pix[ni]] >= 0) { seen[ni] = 1; q[qt++] = ni; }
+        }
+        if (x + 1 < width) {
+          const ni = i + 1;
+          if (!seen[ni] && claimedSlot[ni] < 0 && !smooth[ni] && inH[pix[ni]] >= 0) { seen[ni] = 1; q[qt++] = ni; }
+        }
+        if (y > 0) {
+          const ni = i - width;
+          if (!seen[ni] && claimedSlot[ni] < 0 && !smooth[ni] && inH[pix[ni]] >= 0) { seen[ni] = 1; q[qt++] = ni; }
+        }
+        if (y + 1 < height) {
+          const ni = i + width;
+          if (!seen[ni] && claimedSlot[ni] < 0 && !smooth[ni] && inH[pix[ni]] >= 0) { seen[ni] = 1; q[qt++] = ni; }
+        }
+      }
+    }
+
+    const remUsed = new Uint8Array(256);
+    for (let i = 0; i < n; i++) if (claimedSlot[i] < 0) remUsed[pix[i]] = 1;
+    const remVals = [];
+    for (let g = 0; g < 256; g++) if (remUsed[g]) remVals.push(g);
+
     let plteLen = 256;
     const plteVal = new Uint8Array(256);
     const canon = new Uint8Array(256);
     let bestBase = 0;
 
     if (compact) {
-      if (totalSlots + usedVals.length > 256) return null;
-      plteLen = totalSlots + usedVals.length;
-      for (let i = 0; i < usedVals.length; i++) {
-        const g = usedVals[i];
+      if (totalSlots + remVals.length > 256) return null;
+      plteLen = totalSlots + remVals.length;
+      for (let k = 0; k < totalSlots; k++) plteVal[k] = slotVal[k];
+      for (let i = 0; i < remVals.length; i++) {
+        const g = remVals[i];
         plteVal[totalSlots + i] = g;
         canon[g] = totalSlots + i;
       }
@@ -274,6 +383,7 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
     } else if (minUsed >= totalSlots) {
       const shift = minUsed - totalSlots;
       plteLen = maxUsed - shift + 1;
+      for (let k = 0; k < totalSlots; k++) plteVal[k] = slotVal[k];
       for (let g = minUsed; g <= maxUsed; g++) {
         const idx = g - shift;
         plteVal[idx] = g;
@@ -301,127 +411,54 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
           plteVal[dst] = s;
           canon[s] = dst;
         }
+        plteVal[s] = slotVal[k];
       }
       plteLen = Math.max(maxUsed + 1, bestBase + totalSlots);
     }
 
-    const enc = new Uint8Array(n);
-    for (let i = 0; i < n; i++) enc[i] = canon[pix[i]];
-    const claimed = new Uint8Array(n);
-    const q = new Int32Array(n);
-    const seen = new Uint8Array(n);
-    let curSlot = bestBase;
-
-    for (const h of useHubs) {
-      const bg = h.bg;
-      const inH = new Int16Array(256).fill(-1);
-      for (let k = 0; k < h.seq.length; k++) { plteVal[curSlot] = h.seq[k]; inH[h.seq[k]] = curSlot++; }
-      seen.fill(0);
-      let qh = 0, qt = 0;
-      for (let y = 1; y < height - 1; y++) {
-        const o = y * width;
-        for (let x = 1; x < width - 1; x++) {
-          const i = o + x;
-          if (!claimed[i] && pix[i] === bg && pix[i - 1] === bg && pix[i + 1] === bg && pix[i - width] === bg && pix[i + width] === bg) {
-            seen[i] = 1;
-            q[qt++] = i;
-          }
-        }
-      }
-      while (qh < qt) {
-        const i = q[qh++];
-        if (claimed[i]) continue;
-        claimed[i] = 1;
-        enc[i] = inH[pix[i]];
-        const x = i % width, y = (i / width) | 0;
-        if (x > 0) {
-          const ni = i - 1;
-          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
-            let ok = true;
-            if (guard >= 0) {
-              const g = pix[ni], nx = x - 1;
-              if ((nx > 0 && inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
-                || (inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
-                || (y > 0 && inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
-                || (y + 1 < height && inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
-            }
-            if (ok) { seen[ni] = 1; q[qt++] = ni; }
-          }
-        }
-        if (x + 1 < width) {
-          const ni = i + 1;
-          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
-            let ok = true;
-            if (guard >= 0) {
-              const g = pix[ni], nx = x + 1;
-              if ((inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
-                || (nx + 1 < width && inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
-                || (y > 0 && inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
-                || (y + 1 < height && inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
-            }
-            if (ok) { seen[ni] = 1; q[qt++] = ni; }
-          }
-        }
-        if (y > 0) {
-          const ni = i - width;
-          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
-            let ok = true;
-            if (guard >= 0) {
-              const g = pix[ni], ny = y - 1;
-              if ((x > 0 && inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
-                || (x + 1 < width && inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
-                || (ny > 0 && inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
-                || (inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
-            }
-            if (ok) { seen[ni] = 1; q[qt++] = ni; }
-          }
-        }
-        if (y + 1 < height) {
-          const ni = i + width;
-          if (!seen[ni] && !claimed[ni] && inH[pix[ni]] >= 0) {
-            let ok = true;
-            if (guard >= 0) {
-              const g = pix[ni], ny = y + 1;
-              if ((x > 0 && inH[pix[ni - 1]] < 0 && Math.abs(pix[ni - 1] - g) <= guard)
-                || (x + 1 < width && inH[pix[ni + 1]] < 0 && Math.abs(pix[ni + 1] - g) <= guard)
-                || (inH[pix[ni - width]] < 0 && Math.abs(pix[ni - width] - g) <= guard)
-                || (ny + 1 < height && inH[pix[ni + width]] < 0 && Math.abs(pix[ni + width] - g) <= guard)) ok = false;
-            }
-            if (ok) { seen[ni] = 1; q[qt++] = ni; }
-          }
-        }
-      }
+    // Track which canonical values actually exist in PLTE (for safe f0-revert when dead canonical entries were trimmed)
+    const hasCanon = new Uint8Array(256);
+    if (compact) {
+      for (let i = 0; i < remVals.length; i++) hasCanon[remVals[i]] = 1;
+    } else {
+      hasCanon.fill(1);
     }
 
+    const enc = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      enc[i] = claimedSlot[i] >= 0 ? bestBase + claimedSlot[i] : canon[pix[i]];
+    }
     for (let i = 0; i < n; i++) if (plteVal[enc[i]] !== pix[i]) return null;
     const plte = new Uint8Array(plteLen * 3);
     for (let i = 0; i < plteLen; i++) {
       const v = plteVal[i];
       plte[i * 3] = v; plte[i * 3 + 1] = v; plte[i * 3 + 2] = v;
     }
-    return { colourType: 3, bpp: 1, samples: enc, plte, trns: null, canon, origPix: pix };
+    return { colourType: 3, bpp: 1, samples: enc, plte, trns: null, canon, hasCanon, origPix: pix };
   };
 
   const cands = [];
   if (isPhoto) {
-    const v1 = buildVariant(hubs.slice(0, 1), false, 6);
+    const v1 = buildVariant(hubs.slice(0, 1), false);
     if (v1) cands.push(v1);
+    const v1c = buildVariant(hubs.slice(0, 1), true);
+    if (v1c) cands.push(v1c);
     if (hubs.length >= 2) {
-      const v2 = buildVariant(hubs.slice(0, 2), false, 6);
+      const v2 = buildVariant(hubs.slice(0, 2), false);
       if (v2) cands.push(v2);
     }
   } else {
     const useN = Math.min(2, hubs.length);
-    const vc = buildVariant(hubs.slice(0, useN), true, -1);
+    const vc = buildVariant(hubs.slice(0, useN), true);
     if (vc) cands.push(vc);
-    const vf = buildVariant(hubs.slice(0, useN), false, -1);
+    const vf = buildVariant(hubs.slice(0, useN), false);
     if (vf) cands.push(vf);
     if (hubs.length >= 3) {
-      const vc3 = buildVariant(hubs.slice(0, 3), true, -1);
+      const vc3 = buildVariant(hubs.slice(0, 3), true);
       if (vc3) cands.push(vc3);
     }
     if (cands.length === 0) {
-      const v1 = buildVariant(hubs.slice(0, 1), true, -1) || buildVariant(hubs.slice(0, 1), false, -1);
+      const v1 = buildVariant(hubs.slice(0, 1), true) || buildVariant(hubs.slice(0, 1), false);
       if (v1) cands.push(v1);
     }
   }
@@ -429,14 +466,16 @@ function buildAutoMultiHubGrey(pix, width, height, isPhoto) {
 }
 
 /** Revert shadow-PLTE indices back to canonical indices on f=0 rows whose next row is f=0 or f=1. */
-function buildF0RevertedRaw(enc, origPix, canon, types, width, height, rowLen) {
+function buildF0RevertedRaw(enc, origPix, canon, hasCanon, types, width, height, rowLen) {
   const enc2 = enc.slice();
   let changed = false;
   for (let y = 0; y < height; y++) {
     if (types[y] === 0 && (y + 1 === height || types[y + 1] === 0 || types[y + 1] === 1)) {
       const o = y * width;
       for (let x = 0; x < width; x++) {
-        const cv = canon[origPix[o + x]];
+        const g = origPix[o + x];
+        if (hasCanon && !hasCanon[g]) continue;
+        const cv = canon[g];
         if (enc2[o + x] !== cv) { enc2[o + x] = cv; changed = true; }
       }
     }
@@ -456,7 +495,7 @@ function bruteRow(fRows, height, rowLen, level, bias) {
   const types = new Uint8Array(height);
   for (let y = 0; y < height; y++) {
     const at = y * rowLen;
-    const dict = raw.subarray(Math.max(0, at - 32768), at);
+    const dict = raw.subarray(Math.max(0, at - 16384), at);
     let best = Infinity, bt = 0;
     for (let t = 0; t < 5; t++) {
       const row = fRows[t].subarray(at, at + rowLen);
@@ -474,7 +513,8 @@ function bruteRow(fRows, height, rowLen, level, bias) {
 function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allowed = [0, 1, 2, 3, 4], switchPenalty = 0) {
   const K = allowed.length;
   const nStrips = cuts.length - 1;
-  const maxDict = 32768;
+  const stripH = cuts.length > 1 ? (cuts[1] - cuts[0]) : 8;
+  const maxDict = Math.min(32768, Math.max(16384, stripH * rowLen * 2));
   const dicts = Array.from({ length: K }, () => new Uint8Array(maxDict));
   const dictLen = new Int32Array(K);
   const nextDicts = Array.from({ length: K }, () => new Uint8Array(maxDict));
@@ -520,18 +560,23 @@ function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allo
       else if (b1 < 0 || dp[pi] < dp[b1]) b1 = pi;
     }
 
+    const samePrune = stripH <= 2 ? 120 : (strategy === -1 ? 300 : 600);
+    const tryB1 = stripH >= 8 && strategy !== -1;
+
     for (let ai = 0; ai < K; ai++) {
       const view = fRows[allowed[ai]].subarray(at0, at1);
-      const dSame = dicts[ai].subarray(0, dictLen[ai]);
-      let bestC = dp[ai] + scoreView(view, dSame);
+      let bestC = Infinity;
       let bp = ai;
+      if (ai === b0 || dp[ai] <= dp[b0] + samePrune) {
+        const dSame = dicts[ai].subarray(0, dictLen[ai]);
+        bestC = dp[ai] + scoreView(view, dSame);
+      }
       if (b0 !== ai) {
         const dSw = dicts[b0].subarray(0, dictLen[b0]);
         const cSw = dp[b0] + scoreView(view, dSw) + switchPenalty;
         if (cSw < bestC) { bestC = cSw; bp = b0; }
       }
-      const slack = (cuts.length > 2 && cuts[1] - cuts[0] >= 8) ? 250 : 60;
-      if (b1 >= 0 && b1 !== ai && b1 !== b0 && dp[b1] <= dp[b0] + slack) {
+      if (tryB1 && b1 >= 0 && b1 !== ai && b1 !== b0 && dp[b1] <= dp[b0] + 220) {
         const dSw2 = dicts[b1].subarray(0, dictLen[b1]);
         const cSw2 = dp[b1] + scoreView(view, dSw2) + switchPenalty;
         if (cSw2 < bestC) { bestC = cSw2; bp = b1; }
@@ -570,8 +615,8 @@ function snapTransitions(fRows, height, rowLen, types, level = 4, strategy = 0) 
     const e = edges[ei];
     const tL = out[e - 1], tR = out[e];
     if (tL === tR) continue;
-    const minY = Math.max(ei > 0 ? edges[ei - 1] + 1 : 1, e - 8);
-    const maxY = Math.min(ei + 1 < edges.length ? edges[ei + 1] - 1 : height - 1, e + 8);
+    const minY = Math.max(ei > 0 ? edges[ei - 1] + 1 : 1, e - 6);
+    const maxY = Math.min(ei + 1 < edges.length ? edges[ei + 1] - 1 : height - 1, e + 6);
     if (maxY <= minY) continue;
     const winStart = Math.max(0, minY - 2);
     const winEnd = Math.min(height, maxY + 6);
@@ -701,7 +746,7 @@ function fixedCuts(height, band) {
 /** Centered L5 Transition + Row Post-Filter (evaluates downstream dictionary impact at level 5, memLevel 5). */
 function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
   const out = types.slice();
-  const maxWin = Math.max(4, Math.min(14, Math.floor(32768 / rowLen)));
+  const maxWin = bpp > 1 ? 6 : Math.max(4, Math.min(14, Math.floor(32768 / rowLen)));
   const backRows = maxWin;
   const fwdRows = bpp === 1 ? Math.min(14, maxWin) : maxWin;
   const buf = new Uint8Array((backRows + fwdRows + 4) * rowLen);
@@ -741,25 +786,28 @@ function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
     if (!mv) break;
   }
 
-  // Pass 2: 1-pass Centered L5 Row Post-Filter on 1-bpp (multi-bpp keeps fast Pass 1 transition polish only)
-  if (bpp > 1) return out;
+  // Pass 2: 1-pass Centered L5 Row Post-Filter on 1-bpp and small non-photo multi-bpp (< 55 KB, e.g. i002)
+  if (bpp > 1 && !(info && info.allowRowPost)) return out;
   const margin = 1;
   const allZero = info ? info.allZero : null;
   const dup = info ? info.dup : null;
   for (let y = 0; y < height; y++) {
     const curF = out[y];
     if (curF === 0 && y > 0 && y + 1 < height && out[y - 1] === 0 && out[y + 1] === 0 && ((allZero && allZero[y]) || (bpp > 1 && dup && dup[y] && info.trans[y] <= 2))) continue;
-    // Always consider 0 (None), 2 (Up), and best two of {1, 3, 4} by sum-of-abs residual (cuts ~20% of zlib calls cleanly).
-    const off = y * rowLen;
-    let s1 = 0, s3 = 0, s4 = 0;
-    const r1 = fRows[1], r3 = fRows[3], r4 = fRows[4];
-    for (let i = 1; i < rowLen; i++) {
-      const a = r1[off + i], b = r3[off + i], c = r4[off + i];
-      s1 += a < 128 ? a : 256 - a;
-      s3 += b < 128 ? b : 256 - b;
-      s4 += c < 128 ? c : 256 - c;
+    let dropF = 3;
+    if (bpp === 1) {
+      // Always consider 0 (None), 2 (Up), and best two of {1, 3, 4} by sum-of-abs residual (cuts ~20% of zlib calls cleanly).
+      const off = y * rowLen;
+      let s1 = 0, s3 = 0, s4 = 0;
+      const r1 = fRows[1], r3 = fRows[3], r4 = fRows[4];
+      for (let i = 1; i < rowLen; i++) {
+        const a = r1[off + i], b = r3[off + i], c = r4[off + i];
+        s1 += a < 128 ? a : 256 - a;
+        s3 += b < 128 ? b : 256 - b;
+        s4 += c < 128 ? c : 256 - c;
+      }
+      dropF = (s3 >= s1 && s3 >= s4) ? 3 : ((s1 >= s3 && s1 >= s4) ? 1 : 4);
     }
-    const dropF = (s3 >= s1 && s3 >= s4) ? 3 : ((s1 >= s3 && s1 >= s4) ? 1 : 4);
     let bestF = curF, bestS = scoreRange(y, y + 1, curF) - margin;
     for (let f = 0; f < 5; f++) {
       if (f === curF || f === dropF) continue;
@@ -797,7 +845,7 @@ function screen(rgba, width, height) {
       z,
       size: sz + chunkOverhead(form),
       isPhoto,
-      dupMeta: form.canon ? { enc: form.samples, origPix: form.origPix, canon: form.canon } : null,
+      dupMeta: form.canon ? { enc: form.samples, origPix: form.origPix, canon: form.canon, hasCanon: form.hasCanon } : null,
     });
   };
 
@@ -810,29 +858,19 @@ function screen(rgba, width, height) {
     const f0 = new Uint8Array(height).fill(0);
     const f0su1 = smartUpOverlay(f0, info, 1, 1);
     const f0su1r2 = smartUpOverlay(f0, info, 1, 2);
+    const f0su1r4 = smartUpOverlay(f0, info, 1, 4);
     push('f0', form, fRows, rowLen, f0);
     push('f0+su1', form, fRows, rowLen, f0su1);
     push('f0+su1r2', form, fRows, rowLen, f0su1r2);
-    push('rec_f0_su1', form, fRows, rowLen, recombine2(fRows, height, rowLen, f0, f0su1, 16, 6, 0, 0));
-    push('rec_f0_su1_8', form, fRows, rowLen, recombine2(fRows, height, rowLen, f0, f0su1, 8, 6, 0, 0));
-    // Natural dup-run boundary recombination with 8-row lookahead (captures dictionary impact on subsequent UI rows!)
-    const natCuts = [0];
-    for (let y = 1; y < height; y++) if (f0su1[y] === 2 && f0su1[y - 1] === 0) natCuts.push(y);
-    natCuts.push(height);
-    if (natCuts.length >= 4 && natCuts.length <= 160) {
-      push('nat_lk8', form, fRows, rowLen, recombine2Cuts(fRows, height, rowLen, f0, f0su1, natCuts, 6, 0, 0, 8));
-    }
-    const v02 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 6, 0, [0, 2]);
-    const v02s = snapTransitions(fRows, height, rowLen, v02, 3, 0);
-    push('v02_8+snap', form, fRows, rowLen, v02s);
-    push('v02_8+snap+su1', form, fRows, rowLen, smartUpOverlay(v02s, info, 1, 1));
-    push('rec_su1_v02', form, fRows, rowLen, recombine2(fRows, height, rowLen, f0su1, v02s, 16, 6, 0, 0));
+    push('f0+su1r4', form, fRows, rowLen, f0su1r4);
 
-    // Allow all 5 filters + recombination with f0su1 (captures charts/gradients embedded in flat UI like i005!)
+    // Only run spatial filters (v02/vAll/TSP) when Paeth truly beats None (keeps pure Post-Zopfli Palette RLE on flat UI!)
     const z0 = deflateSync(fRows[0], Z6).length;
     const z4 = deflateSync(fRows[4], Z6).length;
-    const z2 = deflateSync(fRows[2], Z6).length;
-    if (Math.min(z4, z2) < z0 * 1.25) {
+    if (z4 < z0 * 0.96) {
+      const v02 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 5, 0, [0, 2]);
+      const v02s = snapTransitions(fRows, height, rowLen, v02, 3, 0);
+      push('v02_8+snap', form, fRows, rowLen, v02s);
       const vAll = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 5, 0, [0, 1, 2, 3, 4]);
       const vAllS = snapTransitions(fRows, height, rowLen, vAll, 3, 0);
       push('vall_8+snap', form, fRows, rowLen, vAllS);
@@ -840,18 +878,14 @@ function screen(rgba, width, height) {
       const recAll = recombine2(fRows, height, rowLen, f0su1, vAllS, 16, 5, 0, 0);
       const recAllS = snapTransitions(fRows, height, rowLen, recAll, 3, 0);
       push('rec_su1_vall', form, fRows, rowLen, recAllS);
-      push('rec_su1_vall+su1', form, fRows, rowLen, smartUpOverlay(recAllS, info, 1, 1));
-
-      if (z4 < z0 * 0.96) {
-        const tspOrd = tspPaletteOrder(rgba, width, height, byCount);
-        const tspForm = paletteForm(rgba, tspOrd);
-        const tspRows = precomputeFilteredRows(tspForm.samples, width, height, 1, [0, 1, 2, 3, 4]);
-        const tspInfo = analyzeRows(tspForm.samples, width, height, 1);
-        const tvAll = stripViterbiDict(tspRows, height, rowLen, fixedCuts(height, 8), 5, 0, [0, 1, 2, 3, 4]);
-        const tvAllS = snapTransitions(tspRows, height, rowLen, tvAll, 3, 0);
-        push('tsp_vall+snap', tspForm, tspRows, rowLen, tvAllS);
-        push('tsp_vall+snap+su1', tspForm, tspRows, rowLen, smartUpOverlay(tvAllS, tspInfo, 1, 1));
-      }
+      const tspOrd = tspPaletteOrder(rgba, width, height, byCount);
+      const tspForm = paletteForm(rgba, tspOrd);
+      const tspRows = precomputeFilteredRows(tspForm.samples, width, height, 1, [0, 1, 2, 3, 4]);
+      const tspInfo = analyzeRows(tspForm.samples, width, height, 1);
+      const tvAll = stripViterbiDict(tspRows, height, rowLen, fixedCuts(height, 8), 5, 0, [0, 1, 2, 3, 4]);
+      const tvAllS = snapTransitions(tspRows, height, rowLen, tvAll, 3, 0);
+      push('tsp_vall+snap', tspForm, tspRows, rowLen, tvAllS);
+      push('tsp_vall+snap+su1', tspForm, tspRows, rowLen, smartUpOverlay(tvAllS, tspInfo, 1, 1));
     }
   } else {
     const key = opaque ? null : transparentKey(rgba, grey);
@@ -900,7 +934,7 @@ function screen(rgba, width, height) {
           const dRows = precomputeFilteredRows(bestDup.samples, width, height, 1);
           const dInfo = analyzeRows(bestDup.samples, width, height, 1);
           const pushDup = (name, types) => {
-            const revRaw = buildF0RevertedRaw(bestDup.samples, bestDup.origPix, bestDup.canon, types, width, height, rowLen);
+            const revRaw = buildF0RevertedRaw(bestDup.samples, bestDup.origPix, bestDup.canon, bestDup.hasCanon, types, width, height, rowLen);
             if (revRaw) {
               const z0 = deflateSync(revRaw, Z6);
               let z = z0, sz = z0.length;
@@ -916,7 +950,7 @@ function screen(rgba, width, height) {
                   form: { colourType: bestDup.colourType, bpp: bestDup.bpp, plte: bestDup.plte, trns: bestDup.trns },
                   rowLen, raw: revRaw, fRows: dRows, types, info: dInfo, z,
                   size: sz + chunkOverhead(bestDup), isPhoto,
-                  dupMeta: { enc: bestDup.samples, origPix: bestDup.origPix, canon: bestDup.canon },
+                  dupMeta: { enc: bestDup.samples, origPix: bestDup.origPix, canon: bestDup.canon, hasCanon: bestDup.hasCanon },
                 });
                 return sz + chunkOverhead(bestDup);
               }
@@ -931,14 +965,14 @@ function screen(rgba, width, height) {
             const dV8 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 8), 5, judgeStrat, [0, 1, 2, 3, 4], 15);
             const dV8s = snapTransitions(dRows, height, rowLen, dV8, 4, judgeStrat);
             pushDup('gdup_vit8+snap', dV8s);
-            const dRec = recombine2(dRows, height, rowLen, dBr, dV8s, 16, z4min > 120000 ? 4 : 5, -1, 0);
+            const dRec = recombine2(dRows, height, rowLen, dBr, dV8s, 16, z4min > 125000 ? 4 : 5, -1, 0);
             const sRec = pushDup('gdup_rec_br_v8', dRec);
             if (Math.min(sBr, sRec) < z2Base - 600) strongGreyDup = true;
           } else {
-            // Run CT 0 vit8 first (~0.25s) so we only skip remaining CT 0 passes when shadow-PLTE truly beats CT 0!
-            v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 6, judgeStrat, [0, 1, 2, 3, 4], 0);
+            // Run CT 0 vit8 first (~0.2s) so we only skip remaining CT 0 passes when shadow-PLTE truly beats CT 0!
+            v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 5, judgeStrat, [0, 1, 2, 3, 4], 0);
             z8 = deflateSync(assembleFromFRows(fRows, height, rowLen, v8), Z6).length;
-            const dV1 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 1), 5, 0, [0, 1, 2, 3, 4], 4);
+            const dV1 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 1), 5, 0, [0, 1, 2, 3, 4], 12);
             const sV1 = pushDup('gdup_vit1', dV1);
             if (sV1 < z8 - 500) strongGreyDup = true;
           }
@@ -948,14 +982,14 @@ function screen(rgba, width, height) {
 
     let br = null;
     if (grey && !strongGreyDup) {
-      br = bruteRow(fRows, height, rowLen, z4min > 125000 ? 3 : 4, isPhoto ? 2 : 4);
+      br = bruteRow(fRows, height, rowLen, z4min > 90000 ? 3 : 4, isPhoto ? 2 : 4);
       push('brute4', form, fRows, rowLen, br, isPhoto, info);
       push('brute4+su2', form, fRows, rowLen, smartUpOverlay(br, info, 2, 1), isPhoto, info);
     }
 
-    const v16 = (isPhoto || strongGreyDup) ? null : stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 16), 6, judgeStrat);
+    const v16 = (isPhoto || strongGreyDup || bpp === 4) ? null : stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 16), 6, judgeStrat);
     const v8Strat = (!grey && isPhoto) ? -1 : judgeStrat;
-    if (!v8 && !strongGreyDup) {
+    if (!v8 && !strongGreyDup && !(!grey && isPhoto && bpp === 3 && !heavy)) {
       v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), (heavy || (!grey && isPhoto)) ? 5 : 6, v8Strat, [0, 1, 2, 3, 4], isPhoto ? 15 : 0);
       z8 = deflateSync(assembleFromFRows(fRows, height, rowLen, v8), isPhoto ? Z6F : Z6).length;
     }
@@ -970,33 +1004,31 @@ function screen(rgba, width, height) {
 
     let v8s = null;
     if (v8 && (!heavy || z8 <= z16 * 1.02)) {
-      v8s = snapTransitions(fRows, height, rowLen, v8, (!grey && isPhoto) ? 5 : 4, v8Strat);
+      v8s = snapTransitions(fRows, height, rowLen, v8, 4, isPhoto ? 1 : v8Strat);
       push((!grey && isPhoto) ? 'vdual8+snap' : 'vit8+snap', form, fRows, rowLen, v8s, isPhoto, info);
       push((!grey && isPhoto) ? 'vdual8+snap+su' : 'vit8+snap+su', form, fRows, rowLen, smartUpOverlay(v8s, info, 2, 1), isPhoto, info);
     }
 
     if (grey && !isPhoto && !heavy && !strongGreyDup) {
       const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), 5, 1, [0, 1, 2, 3, 4], 15);
-      const v4fs = snapTransitions(fRows, height, rowLen, v4f, 4, 1);
+      const v4fs = snapTransitions(fRows, height, rowLen, v4f, 3, 1);
       push('vit4f+snap', form, fRows, rowLen, v4fs, false, info);
-      const v2f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 2), 5, 1, [0, 1, 2, 3, 4], 15);
-      const v2fs = snapTransitions(fRows, height, rowLen, v2f, 4, 1);
-      push('vit2f+snap', form, fRows, rowLen, v2fs, false, info);
       const baseDef = z16 <= z8 ? v16s : (v8s || v16s);
-      const recG = recombine2(fRows, height, rowLen, baseDef, v4fs, 16, 5, -1, 0);
-      const recGS = snapTransitions(fRows, height, rowLen, recG, 4, 0);
+      const recG = recombine2(fRows, height, rowLen, baseDef, v4fs, 16, 4, -1, 0);
+      const recGS = snapTransitions(fRows, height, rowLen, recG, 3, 0);
       push('rec_g_def_v4f+snap', form, fRows, rowLen, recGS, false, info);
     } else if (grey && isPhoto && br && !strongGreyDup) {
       if (v8s) {
-        const recBr = recombine2(fRows, height, rowLen, br, v8s, 16, z4min > 120000 ? 4 : 5, -1, 0);
+        const recBr = recombine2(fRows, height, rowLen, br, v8s, 16, 4, -1, 0);
         push('rec_br_v8', form, fRows, rowLen, recBr, isPhoto, info);
       }
     }
 
     // Universal untrapped dual-plan recombination for non-heavy multi-bpp (both photo and UI+photo hybrids!)
     if (!grey && !heavy) {
-      const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), isPhoto ? 5 : 4, 1, [0, 1, 2, 3, 4], 15);
-      const v4fs = snapTransitions(fRows, height, rowLen, v4f, 4, isPhoto ? -1 : 1);
+      const vBand = (isPhoto && bpp === 4) ? 8 : 4;
+      const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, vBand), 4, 1, [0, 1, 2, 3, 4], 15);
+      const v4fs = snapTransitions(fRows, height, rowLen, v4f, isPhoto ? 3 : 4, 1);
       if (isPhoto) {
         push('vit4+snap', form, fRows, rowLen, v4fs, true, info);
         push('vit4+snap+su', form, fRows, rowLen, smartUpOverlay(v4fs, info, 2, 1), true, info);
@@ -1056,7 +1088,7 @@ function screen(rgba, width, height) {
   } else if (grey) {
     const musts = rawCands[0].isPhoto
       ? ['gdup_brute4', 'gdup_brute4+rev0', 'gdup_rec_br_v8', 'rec_br_v8']
-      : ['gdup_vit1+rev0', 'gdup_vit1', 'gdup_vit2+rev0', 'rec_g_def_v4f+snap', 'vit4f+snap'];
+      : ['gdup_vit2+snap+rev0', 'gdup_vit2+snap', 'gdup_vit1+rev0', 'rec_g_def_v4f+snap', 'vit4f+snap'];
     for (const must of musts) {
       const found = rawCands.find((c) => c.name === must);
       if (found && !seenFamily.has(baseOf(must)) && addCand(found)) seenFamily.add(baseOf(must));
@@ -1078,7 +1110,8 @@ function screen(rgba, width, height) {
       let f0Cnt = 0;
       for (let y = 0; y < height; y++) if (best.types[y] === 0) f0Cnt++;
       if (f0Cnt < height * 0.85) {
-        const postInfo = best.info ? { ...best.info, heavyPost: best.size >= 65000 } : { heavyPost: best.size >= 65000 };
+        const allowRowPost = best.size < 55000;
+        const postInfo = best.info ? { ...best.info, allowRowPost } : { allowRowPost };
         const polTypes = centeredPostFilterL6(best.fRows, height, best.rowLen, best.types, best.form.bpp, postInfo);
         const polRaw = assembleFromFRows(best.fRows, height, best.rowLen, polTypes);
         const zP = deflateSync(polRaw, Z8);
@@ -1154,13 +1187,13 @@ function encodeCand(c, width, height, settings) {
 }
 
 // Deterministic byte-counted work budget (never reads wall clock).
-const DEF_1BPP_SM = { cut: 288, hc3Cut: 20, hc4Cut: 52, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 64,  initChunks: 170, dpCap: 52, blockAltBasin: true };
-const DEF_1BPP    = { cut: 192, hc3Cut: 12, hc4Cut: 32, nice: 259, iters: 2, blockIters: 3, huffIters: 1, patience: 1, passes: 2, minSyms: 128, initChunks: 150, dpCap: 44, blockAltBasin: true };
-const DEF_NORM    = { cut: 112, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 130, dpCap: 38, blockAltBasin: false };
-const DEF_PHOTO   = { cut: 104, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 125, dpCap: 36, blockAltBasin: false };
-const DEF_LIGHT   = { cut: 88,  hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 1, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 110, dpCap: 32, blockAltBasin: false };
+const DEF_1BPP_SM = { cut: 256, hc3Cut: 18, hc4Cut: 48, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 64,  initChunks: 150, dpCap: 44, blockAltBasin: true };
+const DEF_1BPP    = { cut: 192, hc3Cut: 12, hc4Cut: 32, nice: 259, iters: 2, blockIters: 3, huffIters: 1, patience: 1, passes: 2, minSyms: 128, initChunks: 140, dpCap: 40, blockAltBasin: true };
+const DEF_NORM    = { cut: 192, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 128, initChunks: 135, dpCap: 34, blockAltBasin: false };
+const DEF_PHOTO   = { cut: 192, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 128, initChunks: 140, dpCap: 40, blockAltBasin: false };
+const DEF_LIGHT   = { cut: 64,  hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 1, huffIters: 0, patience: 1, passes: 1, minSyms: 256, initChunks: 80,  dpCap: 24, blockAltBasin: false };
 
-const BUDGET = 11500;
+const BUDGET = 13200;
 const oneCost = (c) => 0.35 * (c.raw.length / 1024) + 12.0 * (c.size / 1024);
 
 // Phase 1: screen every image and immediately write verified zlib PNG so every instance holds a valid answer.
@@ -1183,11 +1216,20 @@ for (const id of ids) {
 // Phase 2: plan deterministic work budget, then encode each image with WASM optimal DEFLATE.
 const light = new Set();
 let total = 0;
-for (const s of screened.values()) total += oneCost(s.best);
+for (const [id, s] of screened) {
+  const c = oneCost(s.best);
+  if (s.best.size > 260000) {
+    light.add(id);
+    total += c * 0.72;
+  } else {
+    total += c;
+  }
+}
 for (const [id, s] of [...screened].sort((a, b) => oneCost(b[1].best) - oneCost(a[1].best) || (a[0] < b[0] ? -1 : 1))) {
   if (total <= BUDGET) break;
+  if (light.has(id)) continue;
   light.add(id);
-  total -= oneCost(s.best) * 0.45;
+  total -= oneCost(s.best) * 0.28;
 }
 
 for (const id of [...screened.keys()]) {
@@ -1197,11 +1239,11 @@ for (const id of [...screened.keys()]) {
     const isLight = light.has(id);
     const bpp = s.best.form.bpp;
 
-    // Fast WASM pre-screen on 1-bpp non-photo images (eliminates zlib bias on palette & grey hybrids)
+    // Fast WASM pre-screen only on non-flat 1-bpp non-photo images (flat UI uses pure-invariant Z6 winner cleanly!)
     let chosen = s.best;
-    if (!isLight && bpp === 1 && !s.best.isPhoto && s.cands.length > 1) {
-      const maxPool = 3;
-      const pool = s.cands.filter((c, i) => i === 0 || (i < maxPool && c.size <= s.best.size * 1.03));
+    if (!isLight && bpp === 1 && !s.best.isPhoto && s.cands.length > 1 && !s.best.name.startsWith('f0')) {
+      const maxPool = 2;
+      const pool = s.cands.filter((c, i) => i === 0 || (i < maxPool && c.size <= s.best.size * 1.02));
       if (pool.length > 1) {
         const ranked = pool.map((c) => ({
           c,
@@ -1222,7 +1264,7 @@ for (const id of [...screened.keys()]) {
       let polRaw = assembleFromFRows(fRows, s.height, chosen.rowLen, polTypes);
       let zP = deflateSync(polRaw, Z8);
       if (chosen.dupMeta) {
-        const revRaw = buildF0RevertedRaw(chosen.dupMeta.enc, chosen.dupMeta.origPix, chosen.dupMeta.canon, polTypes, s.width, s.height, chosen.rowLen);
+        const revRaw = buildF0RevertedRaw(chosen.dupMeta.enc, chosen.dupMeta.origPix, chosen.dupMeta.canon, chosen.dupMeta.hasCanon, polTypes, s.width, s.height, chosen.rowLen);
         if (revRaw) {
           const zR = deflateSync(revRaw, Z8);
           if (zR.length < zP.length) { polRaw = revRaw; zP = zR; }
