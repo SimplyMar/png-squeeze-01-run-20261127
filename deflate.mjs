@@ -268,6 +268,11 @@ function headerPlan(llLens, dLens, full = false) {
   for (let i = 0; i < hdist; i++) allLens[hlit + i] = dLens[i];
   const n = hlit + hdist;
 
+  if (!full) {
+    const m = rleGreedy(allLens, n, 1, 1, 1, rleSym, rleExt);
+    return { bits: scoreRle(rleSym, m), hlit, hdist, m };
+  }
+
   let bestBits = Infinity;
   let bestM = 0;
   for (let v = 0; v < 8; v++) {
@@ -276,25 +281,21 @@ function headerPlan(llLens, dLens, full = false) {
     if (bits < bestBits) {
       bestBits = bits;
       bestM = m;
-      if (full) {
-        bestRleSym.set(rleSym.subarray(0, m));
-        bestRleExt.set(rleExt.subarray(0, m));
-      }
+      bestRleSym.set(rleSym.subarray(0, m));
+      bestRleExt.set(rleExt.subarray(0, m));
     }
   }
-  if (full) {
-    scoreRle(bestRleSym, bestM);
-    for (let it = 0; it < 2; it++) {
-      for (let s = 0; s < 19; s++) clCostBuf[s] = clLens[s] > 0 ? clLens[s] : 8;
-      const m = rleDP(allLens, n, clCostBuf, tmpRleSym, tmpRleExt);
-      const bits = scoreRle(tmpRleSym, m);
-      if (bits < bestBits) {
-        bestBits = bits;
-        bestM = m;
-        bestRleSym.set(tmpRleSym.subarray(0, m));
-        bestRleExt.set(tmpRleExt.subarray(0, m));
-      } else break;
-    }
+  scoreRle(bestRleSym, bestM);
+  for (let it = 0; it < 2; it++) {
+    for (let s = 0; s < 19; s++) clCostBuf[s] = clLens[s] > 0 ? clLens[s] : 8;
+    const m = rleDP(allLens, n, clCostBuf, tmpRleSym, tmpRleExt);
+    const bits = scoreRle(tmpRleSym, m);
+    if (bits < bestBits) {
+      bestBits = bits;
+      bestM = m;
+      bestRleSym.set(tmpRleSym.subarray(0, m));
+      bestRleExt.set(tmpRleExt.subarray(0, m));
+    } else break;
   }
   return { bits: bestBits, hlit, hdist, m: bestM };
 }
@@ -399,7 +400,7 @@ function bitsFromHist(llCounts, dCounts, extra, trySmooth = false) {
   const fx = evalFixedBits(llCounts, dCounts, extra);
   if (fx < best) best = fx;
   if (trySmooth) {
-    for (const th of [4, 3]) {
+    for (const th of [4, 3, 2, 5]) {
       optimizeCountsForRle(llCounts, 286, smLL, th);
       optimizeCountsForRle(dCounts, 30, smD, th);
       smLL[256] = 1;
@@ -612,19 +613,20 @@ function filterTransitionSymPoints(data, rowLen, lit, dist, m, minSyms) {
   return symCuts;
 }
 
-function splitHybridDP(data, rowLen, lit, dist, m, minSyms = 256, maxBlocks = 200, initChunks = 180, dpCap = 68) {
-  if (m < 2 * minSyms) return [];
-  const K = Math.min(initChunks, Math.max(2, Math.floor(m / minSyms)));
+function splitHybridDP(data, rowLen, lit, dist, m, minSyms = 256, maxBlocks = 200, initChunks = 180, dpCap = 68, noSlide = false) {
+  const effMin = m < 24000 ? Math.min(minSyms, 96) : minSyms;
+  if (m < 2 * effMin) return [];
+  const K = Math.min(initChunks, Math.max(2, Math.floor(m / effMin)));
   const rawPts = [0];
   for (let i = 1; i < K; i++) rawPts.push(Math.round((i * m) / K));
-  const fPts = filterTransitionSymPoints(data, rowLen, lit, dist, m, minSyms);
+  const fPts = filterTransitionSymPoints(data, rowLen, lit, dist, m, effMin);
   for (const p of fPts) rawPts.push(p);
   rawPts.push(m);
   rawPts.sort((a, b) => a - b);
 
   // Deduplicate keeping minimum gap
   const pts = [0];
-  const minGap = Math.max(64, minSyms >> 1);
+  const minGap = Math.max(48, effMin >> 1);
   for (let i = 1; i < rawPts.length - 1; i++) {
     if (rawPts[i] - pts[pts.length - 1] >= minGap && m - rawPts[i] >= minGap) pts.push(rawPts[i]);
   }
@@ -746,6 +748,8 @@ function splitHybridDP(data, rowLen, lit, dist, m, minSyms = 256, maxBlocks = 20
     chosen[bestI].bits = chosen[bestI].bits + chosen[bestI + 1].bits - bestG;
     chosen.splice(bestI + 1, 1);
   }
+
+  if (noSlide) return chosen.map((s) => s.a).slice(1);
 
   // Stage 3: Fast incremental-histogram boundary sliding
   const lLL = new Int32Array(288), lD = new Int32Array(30);
@@ -887,7 +891,7 @@ function writeBlock(out, data, byteS, byteE, lit, dist, a, b, isFinal) {
   let bestBits = evalDynamicBits(llC, dC, llL, dL, extra, true);
   let useLL = llL.slice(), useD = dL.slice();
 
-  for (const th of [4, 3]) {
+  for (const th of [4, 3, 2, 5]) {
     optimizeCountsForRle(llC, 286, smLL, th);
     optimizeCountsForRle(dC, 30, smD, th);
     smLL[256] = 1;
@@ -953,7 +957,7 @@ const mixLL = new Int32Array(288);
 const mixD = new Int32Array(30);
 
 function iterateRange(eng, L, data, s, e, bestL, bestD, bestM, iters, huffIters, patience, bpp, tryDists, tmpA_L, tmpA_D, tmpB_L, tmpB_D) {
-  let bestBits = optimizeBlockDistances(data, s, bestL, bestD, 0, bestM, tryDists, bpp);
+  let bestBits = blockBits(bestL, bestD, 0, bestM, false);
   let curL = bestL, curD = bestD, curM = bestM;
   let tL = tmpA_L, tD = tmpA_D, oL = tmpB_L, oD = tmpB_D;
   let fails = 0;
@@ -1159,17 +1163,16 @@ export function deflateRawWasm(data, opts = {}) {
 export function estimateDeflateBytes(data, bpp = 1, rowLen = 0, isPhoto = false) {
   const n = data.length;
   const eng = getWasmEngine();
-  const L = eng.prepareMatches(data, 96, 259, bpp, rowLen);
+  const L = eng.prepareMatches(data, 32, 259, bpp, rowLen);
   const gL = new Uint16Array(n + 1);
   const gD = new Uint16Array(n + 1);
   const tL = new Uint16Array(n + 1);
   const tD = new Uint16Array(n + 1);
-  const tryDists = buildTryDists(bpp, rowLen);
 
   if (isPhoto) costsFromLitHeavy(data, 0, n);
   else costsFromFixed(0);
   let bestM = eng.parseRange(L, 0, n, litCostI32, lenCostI32, distCostI32, gL, gD, 0, bpp);
-  let bestB = bpp > 1 ? optimizeBlockDistances(data, 0, gL, gD, 0, bestM, tryDists, bpp) : blockBits(gL, gD, 0, bestM, false);
+  let bestB = blockBits(gL, gD, 0, bestM, false);
   histogram(gL, gD, 0, bestM);
   costsFromCounts(llC, dC);
   const m2 = eng.parseRange(L, 0, n, litCostI32, lenCostI32, distCostI32, tL, tD, 0, bpp);
@@ -1180,20 +1183,12 @@ export function estimateDeflateBytes(data, bpp = 1, rowLen = 0, isPhoto = false)
     bestM = m2;
   }
 
-  // Fast bottom-up split (no O(M^2) DP) + 1-pass per-block re-parse
-  const sp = splitHybridDP(data, rowLen, gL, gD, bestM, 256, 200, 100, 0);
+  // Fast bottom-up split without boundary slide -> accurate block-split byte estimate in ~0.10s!
+  const sp = splitHybridDP(data, rowLen, gL, gD, bestM, 256, 200, 64, 0, true);
   const symB = [0, ...sp, bestM];
-  let totalBits = 0, pos = 0;
+  let totalBits = 0;
   for (let b = 0; b + 1 < symB.length; b++) {
-    const a = symB[b], z = symB[b + 1];
-    const s = pos, e = s + bytesOf(gL, gD, a, z);
-    histogram(gL, gD, a, z);
-    costsFromCounts(llC, dC);
-    const mb = eng.parseRange(L, s, e, litCostI32, lenCostI32, distCostI32, tL, tD, 0, bpp);
-    const b0 = blockBits(gL, gD, a, z, false);
-    const b1 = blockBits(tL, tD, 0, mb, false);
-    totalBits += b1 < b0 ? b1 : b0;
-    pos = e;
+    totalBits += blockBits(gL, gD, symB[b], symB[b + 1], false);
   }
   return Math.ceil(totalBits / 8) + 6;
 }

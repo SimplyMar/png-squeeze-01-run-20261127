@@ -1,8 +1,9 @@
-// Self-assembled inline WebAssembly engine for BT3+Stride match finding and O(1) RMQ Exact-258 DEFLATE parsing.
+// Self-assembled inline WebAssembly engine for BT3+2D-Stride match finding and Exact Pareto-Frontier O(1) RMQ DP.
 // Features:
-//  - Exact BT3 binary-tree match finder + explicit pixel-stride (bpp) and row-stride (rowLen) match injection
-//  - Exact non-monotonic distCost handling in O(1) RMQ parseRMQ (never misses cheaper distant/stride matches)
-//  - Exact multi-block deep-run skipping supporting optimal skipDist in 1..4 (e.g. dist=4 on RGBA, dist=3 on RGB)
+//  - Fast 3-byte Binary Search Tree (BT3) + explicit 2D-stride (bpp, rowLen, rowLen+-bpp, 2*rowLen) insertion-sorted by length
+//  - Exact Prefix-Dominance / Pareto-Frontier pruning in O(1) RMQ parseRMQ (every length evaluated at most once even
+//    with arbitrary non-monotonic distCost)
+//  - Exact multi-block deep-run skipping supporting optimal skipDist in 1..4
 // Pure deterministic integer arithmetic, zero external dependencies, zero prebuilt binary blobs.
 
 const uleb = (v) => {
@@ -60,7 +61,7 @@ const OP = {
   i32_const: 0x41, i64_const: 0x42,
   i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_lt_s: 0x48, i32_lt_u: 0x49,
   i32_gt_s: 0x4a, i32_gt_u: 0x4b, i32_le_s: 0x4c, i32_le_u: 0x4d, i32_ge_s: 0x4e, i32_ge_u: 0x4f,
-  i64_lt_u: 0x53, i64_gt_u: 0x55,
+  i64_lt_u: 0x53,
   i32_add: 0x6a, i32_sub: 0x6b, i32_mul: 0x6c, i32_div_u: 0x6e,
   i32_and: 0x71, i32_or: 0x72, i32_shl: 0x74, i32_shr_u: 0x76,
   i64_add: 0x7c, i64_mul: 0x7e, i64_and: 0x83, i64_or: 0x84, i64_shl: 0x86, i64_shr_u: 0x88,
@@ -86,17 +87,19 @@ const emit = () => {
   return { b, p, c32, c64, lg, ls, lt, ld32, ld32u, ld64, ld8u, ld16u, st32, st64, st16 };
 };
 
-export const OFF_DSYM = 0;           // 32769 bytes (u8)
-export const OFF_LSYM = 32776;       // 259 bytes (u8)
-export const OFF_LCODE_END = 33040;  // 32 * 2 bytes (u16)
-export const OFF_LOG2 = 33104;       // 36 bytes (u8)
-export const OFF_LIT_COST = 33152;   // 256 * 4 bytes (i32)
-export const OFF_LEN_COST = 34176;   // 32 * 4 bytes (i32)
-export const OFF_DIST_COST = 34304;  // 32 * 4 bytes (i32)
-export const OFF_RMQ = 34432;        // 6 * 512 * 8 = 24576 bytes (i64) -> ends 59008
-export const OFF_SCRATCH = 59008;    // 320 * 8 = 2560 bytes (i64) -> ends 61568
-export const OFF_HEAD = 65536;       // (1 << 19) * 4 = 2097152 bytes (i32)
-export const OFF_SON = 2162688;      // 2 * 65536 * 4 = 524288 bytes (i32)
+export const OFF_DSYM = 0;            // 32769 bytes (u8)
+export const OFF_LSYM = 32776;        // 259 bytes (u8)
+export const OFF_LCODE_END = 33040;   // 32 * 2 bytes (u16)
+export const OFF_LOG2 = 33104;        // 36 bytes (u8)
+export const OFF_LIT_COST = 33152;    // 256 * 4 bytes (i32)
+export const OFF_LEN_COST = 34176;    // 32 * 4 bytes (i32)
+export const OFF_DIST_COST = 34304;   // 32 * 4 bytes (i32)
+export const OFF_RMQ = 34432;         // 6 * 512 * 8 = 24576 bytes (i64) -> ends 59008
+export const OFF_SCRATCH = 59008;     // 320 * 8 = 2560 bytes (i64) -> ends 61568
+export const OFF_PARETO_PK = 61568;   // 320 * 4 = 1280 bytes (i32: (dist<<9)|len) -> ends 62848
+export const OFF_PARETO_DC = 62848;   // 320 * 8 = 2560 bytes (i64: distCost) -> ends 65408
+export const OFF_HEAD = 65536;        // (1 << 19) * 4 = 2097152 bytes (i32) -> ends 2162688
+export const OFF_SON = 2162688;       // 2 * 65536 * 4 = 524288 bytes (i32) -> ends 2686976
 export const OFF_DYN = 2700000;
 
 const HBUCKETS = 1 << 19;
@@ -110,14 +113,15 @@ function buildBT3() {
   const L_I = 9, L_M = 10, L_SKIP = 11, L_KD = 12, L_KL = 13, L_LIM = 14, L_CP = 15, L_REC = 16;
   const L_H = 17, L_CUR = 18, L_P0 = 19, L_P1 = 20, L_L0 = 21, L_L1 = 22, L_BEST = 23, L_BD = 24;
   const L_CNT = 25, L_PAIR = 26, L_LEN = 27, L_B1 = 28, L_B2 = 29, L_AI = 30, L_AC = 31;
-  const L_SFLAG = 32, L_K = 33;
+  const L_SFLAG = 32, L_K = 33, L_A0 = 34, L_MS = 35, L_TD = 36, L_VAL = 37, L_J = 38, L_B3 = 39;
 
-  // Helper: test explicit distance `distVar` and emit if match >= 3 (and passes filter)
-  const emitExplicitDist = (distVar, skipIfCloseDominated) => {
-    lg(L_I); lg(distVar); p(OP.i32_ge_u);
+  // Helper: test explicit distance in L_TD (1..32768) and emit if match >= 3
+  // mode 0: always emit; mode 1: emit if len > best || bd > 4; mode 2: emit only if len > best
+  const emitExplicitDist = (mode) => {
+    lg(L_I); lg(L_TD); p(OP.i32_ge_u);
+    lg(L_BD); lg(L_TD); p(OP.i32_ne); p(OP.i32_and);
     p(OP.if, VOID);
-      lg(L_AI); lg(distVar); p(OP.i32_sub); ls(L_AC);
-      // Fast 3-byte match check
+      lg(L_AI); lg(L_TD); p(OP.i32_sub); ls(L_AC);
       lg(L_AC); ld8u(0); lg(L_AI); ld8u(0); p(OP.i32_eq);
       lg(L_AC); ld8u(1); lg(L_AI); ld8u(1); p(OP.i32_eq); p(OP.i32_and);
       lg(L_AC); ld8u(2); lg(L_AI); ld8u(2); p(OP.i32_eq); p(OP.i32_and);
@@ -144,25 +148,28 @@ function buildBT3() {
         p(OP.end);
         p(OP.end);
 
-        if (skipIfCloseDominated) {
-          // Emit rowLen match if longer than best OR if best match wasn't a tiny local distance (<= 4)
-          lg(L_LEN); lg(L_BEST); p(OP.i32_gt_u);
-          lg(L_BD); c32(4); p(OP.i32_gt_u); p(OP.i32_or);
+        if (mode === 0) {
+          lg(L_M); lg(P_CAP); p(OP.i32_ge_u);
+          p(OP.if, VOID); c32(-1); p(OP.ret); p(OP.end);
+          lg(P_MATCH); lg(L_M); c32(2); p(OP.i32_shl); p(OP.i32_add);
+          lg(L_TD); c32(9); p(OP.i32_shl); lg(L_LEN); p(OP.i32_or);
+          st32();
+          lg(L_M); c32(1); p(OP.i32_add); ls(L_M);
+        } else {
+          if (mode === 2) {
+            lg(L_LEN); lg(L_BEST); p(OP.i32_gt_u);
+          } else {
+            lg(L_LEN); lg(L_BEST); p(OP.i32_gt_u);
+            lg(L_BD); c32(4); p(OP.i32_gt_u); p(OP.i32_or);
+          }
           p(OP.if, VOID);
             lg(L_M); lg(P_CAP); p(OP.i32_ge_u);
             p(OP.if, VOID); c32(-1); p(OP.ret); p(OP.end);
             lg(P_MATCH); lg(L_M); c32(2); p(OP.i32_shl); p(OP.i32_add);
-            lg(distVar); c32(9); p(OP.i32_shl); lg(L_LEN); p(OP.i32_or);
+            lg(L_TD); c32(9); p(OP.i32_shl); lg(L_LEN); p(OP.i32_or);
             st32();
             lg(L_M); c32(1); p(OP.i32_add); ls(L_M);
           p(OP.end);
-        } else {
-          lg(L_M); lg(P_CAP); p(OP.i32_ge_u);
-          p(OP.if, VOID); c32(-1); p(OP.ret); p(OP.end);
-          lg(P_MATCH); lg(L_M); c32(2); p(OP.i32_shl); p(OP.i32_add);
-          lg(distVar); c32(9); p(OP.i32_shl); lg(L_LEN); p(OP.i32_or);
-          st32();
-          lg(L_M); c32(1); p(OP.i32_add); ls(L_M);
         }
       p(OP.end);
     p(OP.end);
@@ -184,6 +191,7 @@ function buildBT3() {
   p(OP.loop, VOID);
     lg(L_I); lg(P_N); p(OP.i32_ge_u); p(OP.br_if, 1);
 
+    lg(L_M); ls(L_A0);
     lg(P_OFF); lg(L_I); c32(2); p(OP.i32_shl); p(OP.i32_add); lg(L_M); st32();
 
     lg(P_N); lg(L_I); p(OP.i32_sub); lt(L_LIM);
@@ -224,7 +232,7 @@ function buildBT3() {
           c32((1 << 9) | 258); st32();
           lg(L_M); c32(1); p(OP.i32_add); ls(L_M);
 
-          // If bpp > 1 and the previous bpp bytes also equal b1, emit (bpp, 258) too!
+          // If bpp > 1 and the previous bpp bytes also equal b1, emit (bpp, 258) too
           lg(P_BPP); c32(1); p(OP.i32_gt_u);
           lg(L_I); lg(P_BPP); p(OP.i32_ge_u); p(OP.i32_and);
           p(OP.if, VOID);
@@ -371,20 +379,63 @@ function buildBT3() {
         p(OP.end);
         p(OP.end);
 
-        // Append explicit bpp & rowLen stride matches if not already emitted by BT3
+        // Append explicit 2D-stride matches & insertion-sort by ascending length for exact Pareto-frontier parseRMQ
         lg(L_REC);
         p(OP.if, VOID);
+          lg(L_M); ls(L_MS);
+
           lg(P_BPP); c32(1); p(OP.i32_gt_u);
           lg(L_SFLAG); c32(1); p(OP.i32_and); p(OP.i32_eqz); p(OP.i32_and);
           p(OP.if, VOID);
-            emitExplicitDist(P_BPP, false);
+            lg(P_BPP); ls(L_TD);
+            emitExplicitDist(0);
           p(OP.end);
 
           lg(P_ROW); c32(3); p(OP.i32_ge_u);
           lg(P_ROW); c32(32768); p(OP.i32_le_u); p(OP.i32_and);
-          lg(L_SFLAG); c32(2); p(OP.i32_and); p(OP.i32_eqz); p(OP.i32_and);
           p(OP.if, VOID);
-            emitExplicitDist(P_ROW, true);
+            lg(L_SFLAG); c32(2); p(OP.i32_and); p(OP.i32_eqz);
+            p(OP.if, VOID);
+              lg(P_ROW); ls(L_TD);
+              emitExplicitDist(1);
+            p(OP.end);
+
+            lg(P_ROW); lg(P_BPP); p(OP.i32_sub); lt(L_TD); c32(3); p(OP.i32_ge_u);
+            p(OP.if, VOID); emitExplicitDist(2); p(OP.end);
+
+            lg(P_ROW); lg(P_BPP); p(OP.i32_add); lt(L_TD); c32(32768); p(OP.i32_le_u);
+            p(OP.if, VOID); emitExplicitDist(2); p(OP.end);
+
+            lg(P_ROW); c32(1); p(OP.i32_shl); lt(L_TD); c32(32768); p(OP.i32_le_u);
+            p(OP.if, VOID); emitExplicitDist(2); p(OP.end);
+          p(OP.end);
+
+          // Insertion-sort appended stride matches into [L_A0 .. L_M) by ascending length
+          lg(L_M); lg(L_MS); p(OP.i32_gt_u);
+          lg(L_M); lg(L_A0); c32(1); p(OP.i32_add); p(OP.i32_gt_u); p(OP.i32_and);
+          p(OP.if, VOID);
+            lg(L_MS); ls(L_K);
+            p(OP.block, VOID);
+            p(OP.loop, VOID);
+              lg(L_K); lg(L_M); p(OP.i32_ge_u); p(OP.br_if, 1);
+              lg(P_MATCH); lg(L_K); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); lt(L_VAL);
+              c32(511); p(OP.i32_and); ls(L_LEN);
+              lg(L_K); ls(L_J);
+              p(OP.block, VOID);
+              p(OP.loop, VOID);
+                lg(L_J); lg(L_A0); p(OP.i32_le_u); p(OP.br_if, 1);
+                lg(P_MATCH); lg(L_J); c32(1); p(OP.i32_sub); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); lt(L_B3);
+                c32(511); p(OP.i32_and); lg(L_LEN); p(OP.i32_le_u); p(OP.br_if, 1);
+                lg(P_MATCH); lg(L_J); c32(2); p(OP.i32_shl); p(OP.i32_add); lg(L_B3); st32();
+                lg(L_J); c32(1); p(OP.i32_sub); ls(L_J);
+                p(OP.br, 0);
+              p(OP.end);
+              p(OP.end);
+              lg(P_MATCH); lg(L_J); c32(2); p(OP.i32_shl); p(OP.i32_add); lg(L_VAL); st32();
+              lg(L_K); c32(1); p(OP.i32_add); ls(L_K);
+              p(OP.br, 0);
+            p(OP.end);
+            p(OP.end);
           p(OP.end);
         p(OP.end);
 
@@ -413,25 +464,23 @@ function buildBT3() {
   return {
     params: [I32, I32, I32, I32, I32, I32, I32, I32, I32],
     results: [I32],
-    locals: [[25, I32]],
+    locals: [[31, I32]],
     body: e.b,
   };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Function 1: parseRMQ(dataPtr, offPtr, matchPtr, cLenPtr, cDistPtr, litOutPtr, distOutPtr, s, e, skipDist) -> m
-// Supports exact non-monotonic distCost + multi-block constant-run jump for skipDist in 1..4!
+// Exact Prefix-Dominance / Pareto-Frontier pruning: every length in 3..L_max evaluated at most once!
 function buildParseRMQ() {
-  // Params: 0..9 (P_SKIP = 0 disabled, or 1..4 = optimal constant-run distance)
-  // i32 locals (10..34 = 25 locals)
-  // i64 locals (35..43 = 9 locals: added Q_MAXDC = 43)
   const em = emit();
-  const { p, c32, c64, lg, ls, lt, ld32, ld64, ld8u, ld16u, st64, st16 } = em;
+  const { p, c32, c64, lg, ls, lt, ld32, ld64, ld8u, ld16u, st32, st64, st16 } = em;
   const P_DATA = 0, P_OFF = 1, P_MATCH = 2, P_CLEN = 3, P_CDIST = 4, P_LOUT = 5, P_DOUT = 6, P_S = 7, P_E = 8, P_SKIP = 9;
   const L_N = 10, L_I = 11, L_POS = 12, L_A = 13, L_B = 14, L_K = 15, L_ROOM = 16, L_PREVL = 17;
   const L_PACK = 18, L_L = 19, L_D = 20, L_LO = 21, L_HI = 22, L_C = 23, L_BLEN = 24, L_BDIST = 25;
   const L_LVL = 26, L_IDX = 27, L_M = 28, L_PBYTE = 29, L_SRUN = 30, L_CBYTE = 31, L_LRUN = 32, L_BLKS = 33, L_NEWI = 34;
-  const Q_BCOST = 35, Q_DCOST = 36, Q_EM = 37, Q_E1 = 38, Q_E2 = 39, Q_CAND = 40, Q_C258 = 41, Q_ADD = 42, Q_MAXDC = 43;
+  const L_TOP = 35, L_LASTL = 36;
+  const Q_BCOST = 37, Q_DCOST = 38, Q_EM = 39, Q_E1 = 40, Q_E2 = 41, Q_CAND = 42, Q_C258 = 43, Q_ADD = 44, Q_MINDC = 45;
 
   const INF = 0x3fffffffffffffffn;
 
@@ -453,7 +502,6 @@ function buildParseRMQ() {
   lg(L_N); p(OP.i32_eqz);
   p(OP.if, VOID); c32(0); p(OP.ret); p(OP.end);
 
-  // Q_C258 = lenCost[28] + distCost[max(0, skipDist - 1)]
   c32(OFF_LEN_COST + 28 * 4); ld32();
   lg(P_SKIP); c32(0); p(OP.i32_gt_s);
   p(OP.if, I32);
@@ -597,122 +645,139 @@ function buildParseRMQ() {
       lg(L_A); lg(L_B); p(OP.i32_lt_u);
       p(OP.if, VOID);
         lg(L_N); lg(L_I); p(OP.i32_sub); ls(L_ROOM);
-        c32(2); ls(L_PREVL);
-        c64(0n); ls(Q_MAXDC);
-        lg(L_A); ls(L_K);
+
+        // Pass 1 (backward from B-1 down to A): extract exact Pareto frontier (strictly decreasing L & strictly decreasing distCost)
+        c64(INF); ls(Q_MINDC);
+        c32(0); ls(L_TOP);
+        c32(0); ls(L_LASTL);
+        lg(L_B); c32(1); p(OP.i32_sub); ls(L_K);
 
         p(OP.block, VOID);
         p(OP.loop, VOID);
-          lg(L_K); lg(L_B); p(OP.i32_ge_u); p(OP.br_if, 1);
+          lg(L_K); lg(L_A); p(OP.i32_lt_s); p(OP.br_if, 1);
 
           lg(P_MATCH); lg(L_K); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); lt(L_PACK);
           c32(511); p(OP.i32_and); ls(L_L);
-          lg(L_PACK); c32(9); p(OP.i32_shr_u); ls(L_D);
-
           lg(L_L); lg(L_ROOM); p(OP.i32_gt_u);
           p(OP.if, VOID); lg(L_ROOM); ls(L_L); p(OP.end);
 
           lg(L_L); c32(3); p(OP.i32_ge_u);
           p(OP.if, VOID);
+            lg(L_PACK); c32(9); p(OP.i32_shr_u); ls(L_D);
             c32(OFF_DIST_COST);
             c32(OFF_DSYM); lg(L_D); p(OP.i32_add); ld8u();
             c32(2); p(OP.i32_shl); p(OP.i32_add); ld32();
             p(OP.i64_extend_i32_u); ls(Q_DCOST);
 
-            // Exact non-monotonic distCost bound:
-            // If l > prevL: lo = (dCost < maxDC ? 3 : prevL + 1); prevL = l
-            // Else (appended extra stride/bpp match): only evaluate (lo=3) if dCost < maxDC (otherwise strictly dominated!)
-            c32(0); ls(L_LO);
-            lg(L_L); lg(L_PREVL); p(OP.i32_gt_u);
+            lg(Q_DCOST); lg(Q_MINDC); p(OP.i64_lt_u);
             p(OP.if, VOID);
-              lg(Q_DCOST); lg(Q_MAXDC); p(OP.i64_lt_u);
+              lg(Q_DCOST); ls(Q_MINDC);
+              lg(L_TOP); c32(0); p(OP.i32_gt_u);
+              lg(L_L); lg(L_LASTL); p(OP.i32_eq); p(OP.i32_and);
               p(OP.if, VOID);
-                c32(3); ls(L_LO);
+                lg(L_TOP); c32(1); p(OP.i32_sub); ls(L_IDX);
+                c32(OFF_PARETO_PK); lg(L_IDX); c32(2); p(OP.i32_shl); p(OP.i32_add);
+                lg(L_D); c32(9); p(OP.i32_shl); lg(L_L); p(OP.i32_or); st32();
+                c32(OFF_PARETO_DC); lg(L_IDX); c32(3); p(OP.i32_shl); p(OP.i32_add);
+                lg(Q_DCOST); st64();
               p(OP.else);
-                lg(L_PREVL); c32(1); p(OP.i32_add); ls(L_LO);
-              p(OP.end);
-              lg(L_L); ls(L_PREVL);
-            p(OP.else);
-              lg(Q_DCOST); lg(Q_MAXDC); p(OP.i64_lt_u);
-              p(OP.if, VOID);
-                c32(3); ls(L_LO);
-              p(OP.end);
-            p(OP.end);
-
-            lg(Q_DCOST); lg(Q_MAXDC); p(OP.i64_gt_u);
-            p(OP.if, VOID); lg(Q_DCOST); ls(Q_MAXDC); p(OP.end);
-
-            lg(L_LO); c32(0); p(OP.i32_gt_u);
-            p(OP.if, VOID);
-              // Fast width-1 loop for lo <= min(l, 10)
-              lg(L_LO); c32(10); p(OP.i32_le_u);
-              p(OP.if, VOID);
-                lg(L_L); c32(10); lg(L_L); c32(10); p(OP.i32_lt_u); p(OP.select); ls(L_HI);
-                p(OP.loop, VOID);
-                  c32(OFF_RMQ); lg(L_I); lg(L_LO); p(OP.i32_add); c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
-                  ld64(); c64(22); p(OP.i64_shr_u);
-                  lg(Q_DCOST); p(OP.i64_add);
-                  c32(OFF_LEN_COST - 12); lg(L_LO); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); p(OP.i64_extend_i32_u);
-                  p(OP.i64_add); lt(Q_CAND);
-                  lg(Q_BCOST); p(OP.i64_lt_u);
-                  p(OP.if, VOID);
-                    lg(Q_CAND); ls(Q_BCOST);
-                    lg(L_LO); ls(L_BLEN);
-                    lg(L_D); ls(L_BDIST);
-                  p(OP.end);
-                  lg(L_LO); c32(1); p(OP.i32_add); lt(L_LO); lg(L_HI); p(OP.i32_le_u); p(OP.br_if, 0);
-                p(OP.end);
-              p(OP.end);
-
-              // RMQ loop for lo >= 11
-              lg(L_LO); lg(L_L); p(OP.i32_le_u);
-              p(OP.if, VOID);
-                c32(OFF_LSYM); lg(L_LO); p(OP.i32_add); ld8u(); ls(L_C);
-                p(OP.block, VOID);
-                p(OP.loop, VOID);
-                  lg(L_LO); lg(L_L); p(OP.i32_gt_u); p(OP.br_if, 1);
-
-                  c32(OFF_LCODE_END); lg(L_C); c32(1); p(OP.i32_shl); p(OP.i32_add); ld16u(); ls(L_HI);
-                  lg(L_HI); lg(L_L); p(OP.i32_gt_u);
-                  p(OP.if, VOID); lg(L_L); ls(L_HI); p(OP.end);
-
-                  lg(L_LO); lg(L_HI); p(OP.i32_eq);
-                  p(OP.if, VOID);
-                    c32(OFF_RMQ); lg(L_I); lg(L_LO); p(OP.i32_add); c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
-                    ld64(); ls(Q_EM);
-                  p(OP.else);
-                    c32(OFF_LOG2); lg(L_HI); lg(L_LO); p(OP.i32_sub); c32(1); p(OP.i32_add); p(OP.i32_add); ld8u(); ls(L_LVL);
-                    c32(OFF_RMQ); lg(L_LVL); c32(12); p(OP.i32_shl); p(OP.i32_add); ls(L_IDX);
-                    lg(L_IDX); lg(L_I); lg(L_LO); p(OP.i32_add); c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
-                    ld64(); ls(Q_E1);
-                    lg(L_IDX);
-                    lg(L_I); lg(L_HI); p(OP.i32_add); c32(1); lg(L_LVL); p(OP.i32_shl); p(OP.i32_sub); c32(1); p(OP.i32_add);
-                    c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
-                    ld64(); ls(Q_E2);
-                    lg(Q_E1); lg(Q_E2); lg(Q_E1); lg(Q_E2); p(OP.i64_lt_u); p(OP.select); ls(Q_EM);
-                  p(OP.end);
-
-                  lg(Q_EM); c64(22); p(OP.i64_shr_u);
-                  lg(Q_DCOST); p(OP.i64_add);
-                  c32(OFF_LEN_COST); lg(L_C); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); p(OP.i64_extend_i32_u);
-                  p(OP.i64_add); lt(Q_CAND);
-                  lg(Q_BCOST); p(OP.i64_lt_u);
-                  p(OP.if, VOID);
-                    lg(Q_CAND); ls(Q_BCOST);
-                    lg(Q_EM); c64(0x3fffffn); p(OP.i64_and); p(OP.i32_wrap_i64); lg(L_I); p(OP.i32_sub); ls(L_BLEN);
-                    lg(L_D); ls(L_BDIST);
-                  p(OP.end);
-
-                  lg(L_HI); c32(1); p(OP.i32_add); ls(L_LO);
-                  lg(L_C); c32(1); p(OP.i32_add); ls(L_C);
-                  p(OP.br, 0);
-                p(OP.end);
-                p(OP.end);
+                c32(OFF_PARETO_PK); lg(L_TOP); c32(2); p(OP.i32_shl); p(OP.i32_add);
+                lg(L_D); c32(9); p(OP.i32_shl); lg(L_L); p(OP.i32_or); st32();
+                c32(OFF_PARETO_DC); lg(L_TOP); c32(3); p(OP.i32_shl); p(OP.i32_add);
+                lg(Q_DCOST); st64();
+                lg(L_TOP); c32(1); p(OP.i32_add); ls(L_TOP);
+                lg(L_L); ls(L_LASTL);
               p(OP.end);
             p(OP.end);
           p(OP.end);
 
-          lg(L_K); c32(1); p(OP.i32_add); ls(L_K);
+          lg(L_K); c32(1); p(OP.i32_sub); ls(L_K);
+          p(OP.br, 0);
+        p(OP.end);
+        p(OP.end);
+
+        // Pass 2 (pop Pareto stack top-1 down to 0): strictly increasing L, non-overlapping disjoint intervals!
+        c32(2); ls(L_PREVL);
+        lg(L_TOP); c32(1); p(OP.i32_sub); ls(L_K);
+        p(OP.block, VOID);
+        p(OP.loop, VOID);
+          lg(L_K); c32(0); p(OP.i32_lt_s); p(OP.br_if, 1);
+
+          c32(OFF_PARETO_PK); lg(L_K); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); lt(L_PACK);
+          c32(511); p(OP.i32_and); ls(L_L);
+          lg(L_PACK); c32(9); p(OP.i32_shr_u); ls(L_D);
+          c32(OFF_PARETO_DC); lg(L_K); c32(3); p(OP.i32_shl); p(OP.i32_add); ld64(); ls(Q_DCOST);
+
+          lg(L_PREVL); c32(1); p(OP.i32_add); ls(L_LO);
+          lg(L_L); ls(L_PREVL);
+
+          // Fast width-1 loop for lo <= min(l, 10)
+          lg(L_LO); c32(10); p(OP.i32_le_u);
+          p(OP.if, VOID);
+            lg(L_L); c32(10); lg(L_L); c32(10); p(OP.i32_lt_u); p(OP.select); ls(L_HI);
+            p(OP.loop, VOID);
+              c32(OFF_RMQ); lg(L_I); lg(L_LO); p(OP.i32_add); c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
+              ld64(); c64(22); p(OP.i64_shr_u);
+              lg(Q_DCOST); p(OP.i64_add);
+              c32(OFF_LEN_COST - 12); lg(L_LO); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); p(OP.i64_extend_i32_u);
+              p(OP.i64_add); lt(Q_CAND);
+              lg(Q_BCOST); p(OP.i64_lt_u);
+              p(OP.if, VOID);
+                lg(Q_CAND); ls(Q_BCOST);
+                lg(L_LO); ls(L_BLEN);
+                lg(L_D); ls(L_BDIST);
+              p(OP.end);
+              lg(L_LO); c32(1); p(OP.i32_add); lt(L_LO); lg(L_HI); p(OP.i32_le_u); p(OP.br_if, 0);
+            p(OP.end);
+          p(OP.end);
+
+          // RMQ loop for lo >= 11
+          lg(L_LO); lg(L_L); p(OP.i32_le_u);
+          p(OP.if, VOID);
+            c32(OFF_LSYM); lg(L_LO); p(OP.i32_add); ld8u(); ls(L_C);
+            p(OP.block, VOID);
+            p(OP.loop, VOID);
+              lg(L_LO); lg(L_L); p(OP.i32_gt_u); p(OP.br_if, 1);
+
+              c32(OFF_LCODE_END); lg(L_C); c32(1); p(OP.i32_shl); p(OP.i32_add); ld16u(); ls(L_HI);
+              lg(L_HI); lg(L_L); p(OP.i32_gt_u);
+              p(OP.if, VOID); lg(L_L); ls(L_HI); p(OP.end);
+
+              lg(L_LO); lg(L_HI); p(OP.i32_eq);
+              p(OP.if, VOID);
+                c32(OFF_RMQ); lg(L_I); lg(L_LO); p(OP.i32_add); c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
+                ld64(); ls(Q_EM);
+              p(OP.else);
+                c32(OFF_LOG2); lg(L_HI); lg(L_LO); p(OP.i32_sub); c32(1); p(OP.i32_add); p(OP.i32_add); ld8u(); ls(L_LVL);
+                c32(OFF_RMQ); lg(L_LVL); c32(12); p(OP.i32_shl); p(OP.i32_add); ls(L_IDX);
+                lg(L_IDX); lg(L_I); lg(L_LO); p(OP.i32_add); c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
+                ld64(); ls(Q_E1);
+                lg(L_IDX);
+                lg(L_I); lg(L_HI); p(OP.i32_add); c32(1); lg(L_LVL); p(OP.i32_shl); p(OP.i32_sub); c32(1); p(OP.i32_add);
+                c32(511); p(OP.i32_and); c32(3); p(OP.i32_shl); p(OP.i32_add);
+                ld64(); ls(Q_E2);
+                lg(Q_E1); lg(Q_E2); lg(Q_E1); lg(Q_E2); p(OP.i64_lt_u); p(OP.select); ls(Q_EM);
+              p(OP.end);
+
+              lg(Q_EM); c64(22); p(OP.i64_shr_u);
+              lg(Q_DCOST); p(OP.i64_add);
+              c32(OFF_LEN_COST); lg(L_C); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); p(OP.i64_extend_i32_u);
+              p(OP.i64_add); lt(Q_CAND);
+              lg(Q_BCOST); p(OP.i64_lt_u);
+              p(OP.if, VOID);
+                lg(Q_CAND); ls(Q_BCOST);
+                lg(Q_EM); c64(0x3fffffn); p(OP.i64_and); p(OP.i32_wrap_i64); lg(L_I); p(OP.i32_sub); ls(L_BLEN);
+                lg(L_D); ls(L_BDIST);
+              p(OP.end);
+
+              lg(L_HI); c32(1); p(OP.i32_add); ls(L_LO);
+              lg(L_C); c32(1); p(OP.i32_add); ls(L_C);
+              p(OP.br, 0);
+            p(OP.end);
+            p(OP.end);
+          p(OP.end);
+
+          lg(L_K); c32(1); p(OP.i32_sub); ls(L_K);
           p(OP.br, 0);
         p(OP.end);
         p(OP.end);
@@ -757,7 +822,7 @@ function buildParseRMQ() {
   return {
     params: [I32, I32, I32, I32, I32, I32, I32, I32, I32, I32],
     results: [I32],
-    locals: [[25, I32], [9, I64]],
+    locals: [[27, I32], [9, I64]],
     body: em.b,
   };
 }
@@ -833,7 +898,7 @@ export function getWasmEngine() {
     return { dataPtr, offPtr, cLenPtr, cDistPtr, litOutPtr, distOutPtr, matchPtr, matchCap, n };
   }
 
-  function prepareMatches(data, cut = 384, nice = 259, bpp = 1, rowLen = 0) {
+  function prepareMatches(data, cut = 256, nice = 259, bpp = 1, rowLen = 0) {
     const n = data.length;
     let matchCap = Math.max(2_000_000, n * 4);
     for (;;) {
@@ -850,7 +915,6 @@ export function getWasmEngine() {
   }
 
   function checkCanSkip258(litC, lenC, distC, bpp) {
-    // Allow exact constant-run jump using dist=1 or dist=bpp (when bpp in 2..4), whichever is cheapest!
     let bestD = 1;
     let minC = distC[0];
     if (bpp >= 2 && bpp <= 4 && distC[bpp - 1] < minC) {
