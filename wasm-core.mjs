@@ -619,7 +619,7 @@ function buildBT3() {
               lg(L_K); lg(L_A0); p(OP.i32_lt_s); p(OP.br_if, 1);
               lg(P_MATCH); lg(L_K); c32(2); p(OP.i32_shl); p(OP.i32_add); ld32(); lt(L_VAL);
               c32(9); p(OP.i32_shr_u); c32(OFF_DSYM); p(OP.i32_add); ld8u(); ls(L_DS);
-              lg(L_DS); lg(L_BL); lg(P_BPP); c32(1); p(OP.i32_eq); c32(12); c32(9); p(OP.select); p(OP.i32_add); p(OP.i32_le_u);
+              lg(L_DS); lg(L_BL); lg(P_BPP); c32(1); p(OP.i32_eq); c32(12); c32(4); p(OP.select); p(OP.i32_add); p(OP.i32_le_u);
               lg(L_DS); lg(L_RDS); p(OP.i32_eq); p(OP.i32_or);
               lg(L_DS); c32(4); p(OP.i32_lt_u); p(OP.i32_or);
               p(OP.if, VOID);
@@ -1111,7 +1111,7 @@ export function getWasmEngine() {
 
   function prepareMatches(data, cut = 256, nice = 259, bpp = 1, rowLen = 0, hc3Cut = 64, hc4Cut = 128) {
     const n = data.length;
-    let matchCap = Math.max(3_000_000, n * 4);
+    let matchCap = Math.max(7_000_000, n * 4);
     for (;;) {
       const L = layout(n, matchCap);
       new Uint8Array(memory.buffer, L.dataPtr, n).set(data);

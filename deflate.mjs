@@ -1313,8 +1313,9 @@ export function deflateRawWasm(data, opts = {}) {
   let bestGlobalBits = Infinity;
   let bestBasin = basins[0];
 
-  for (const basin of basins) {
-    let gIt = (basin === 'pixdist' || (isPhoto && basin === 'fixed')) ? Math.max(1, iters - 1) : iters;
+  for (let bi = 0; bi < basins.length; bi++) {
+    const basin = basins[bi];
+    let gIt = (bi > 0 || basin === 'pixdist' || (isPhoto && basin === 'fixed')) ? Math.max(1, iters - 1) : iters;
     let gHuff = basin === 'litheavy' ? 1 : 0;
     if (basin === 'litheavy' && bpp === 1 && bestM > 0) {
       let lits = 0;
@@ -1345,7 +1346,7 @@ export function deflateRawWasm(data, opts = {}) {
   let bestSmBits = passes > 1 ? smoothedTotalBits(best) : best.bits;
   for (let p = 1; p < passes; p++) {
     const p2Iters = Math.max(1, Math.min(2, blockIters - 1));
-    const p2Huff = Math.max(1, huffIters - 1);
+    const p2Huff = bpp === 1 ? Math.max(1, huffIters - 1) : 0;
     const next = splitAndOptimize(eng, L, data, rowLen, bpp, tryDists, best.lit, best.dist, best.starts[best.starts.length - 1], best.byteMap, best.starts, bestBasin, minSyms, maxBlocks, initChunks, dpCap, p2Iters, p2Huff, 1, false, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
     const nextSmBits = smoothedTotalBits(next);
     if (nextSmBits < bestSmBits) { best = next; bestSmBits = nextSmBits; }
@@ -1496,7 +1497,7 @@ export function deflateRawWasm(data, opts = {}) {
 export function estimateDeflateBytes(data, bpp = 1, rowLen = 0, isPhoto = false) {
   const n = data.length;
   const eng = getWasmEngine();
-  const L = eng.prepareMatches(data, 12, 259, bpp, rowLen, 0, 0);
+  const L = eng.prepareMatches(data, 8, 259, bpp, rowLen, 0, 0);
   const gL = new Uint16Array(n + 1);
   const gD = new Uint16Array(n + 1);
 
@@ -1505,7 +1506,7 @@ export function estimateDeflateBytes(data, bpp = 1, rowLen = 0, isPhoto = false)
   const bestM = eng.parseRange(L, 0, n, litCostI32, lenCostI32, distCostI32, gL, gD, 0, bpp);
 
   // Fast bottom-up split without boundary slide -> accurate block-split byte estimate!
-  const sp = splitHybridDP(data, rowLen, gL, gD, bestM, 256, 200, 44, 0, true);
+  const sp = splitHybridDP(data, rowLen, gL, gD, bestM, 256, 200, 32, 0, true);
   const symB = [0, ...sp, bestM];
   let totalBits = 0;
   for (let b = 0; b + 1 < symB.length; b++) {

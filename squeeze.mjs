@@ -20,10 +20,10 @@ import { deflateRaw, estimateDeflateBytes, zlibWrap } from './deflate.mjs';
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const Z6 = { level: 6, memLevel: 9 };
-const Z6F = { level: 6, memLevel: 9, strategy: 1 };
-const Z8 = { level: 8, memLevel: 8 };
-const Z8F = { level: 8, memLevel: 8, strategy: 1 };
+const Z6 = { level: 6, memLevel: 7 };
+const Z6F = { level: 6, memLevel: 7, strategy: 1 };
+const Z8 = { level: 8, memLevel: 7 };
+const Z8F = { level: 8, memLevel: 7, strategy: 1 };
 
 function precomputeFilteredRows(samples, width, height, bpp, allowed = [0, 1, 2, 3, 4]) {
   const stride = width * bpp;
@@ -775,6 +775,10 @@ function screen(rgba, width, height) {
   const { opaque, grey, colours } = analyse(rgba);
   const rawCands = [];
   const push = (name, form, fRows, rowLen, types, isPhoto = false, info = null) => {
+    for (let i = 0; i < rawCands.length; i++) {
+      const prev = rawCands[i];
+      if (prev.fRows === fRows && prev.types && Buffer.compare(prev.types, types) === 0) return;
+    }
     const raw = assembleFromFRows(fRows, height, rowLen, types);
     const z0 = deflateSync(raw, Z6);
     let z = z0, sz = z0.length;
@@ -833,7 +837,7 @@ function screen(rgba, width, height) {
       const vAllS = snapTransitions(fRows, height, rowLen, vAll, 3, 0);
       push('vall_8+snap', form, fRows, rowLen, vAllS);
       push('vall_8+snap+su1', form, fRows, rowLen, smartUpOverlay(vAllS, info, 1, 1));
-      const recAll = recombine2(fRows, height, rowLen, f0su1, vAllS, 16, 6, 0, 0);
+      const recAll = recombine2(fRows, height, rowLen, f0su1, vAllS, 16, 5, 0, 0);
       const recAllS = snapTransitions(fRows, height, rowLen, recAll, 3, 0);
       push('rec_su1_vall', form, fRows, rowLen, recAllS);
       push('rec_su1_vall+su1', form, fRows, rowLen, smartUpOverlay(recAllS, info, 1, 1));
@@ -931,7 +935,7 @@ function screen(rgba, width, height) {
             const sRec = pushDup('gdup_rec_br_v8', dRec);
             if (Math.min(sBr, sRec) < z2Base - 600) strongGreyDup = true;
           } else {
-            // Run CT 0 vit8 first (~0.3s) so we only skip remaining CT 0 passes when shadow-PLTE truly beats CT 0!
+            // Run CT 0 vit8 first (~0.25s) so we only skip remaining CT 0 passes when shadow-PLTE truly beats CT 0!
             v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 6, judgeStrat, [0, 1, 2, 3, 4], 0);
             z8 = deflateSync(assembleFromFRows(fRows, height, rowLen, v8), Z6).length;
             const dV1 = stripViterbiDict(dRows, height, rowLen, fixedCuts(height, 1), 5, 0, [0, 1, 2, 3, 4], 4);
@@ -1020,14 +1024,12 @@ function screen(rgba, width, height) {
 
   const addCand = (c) => {
     if (isDupRaw(c.raw)) return false;
-    const z0 = deflateSync(c.raw, Z8);
-    let z = z0, sz = z0.length;
-    if (c.isPhoto) {
-      const z1 = deflateSync(c.raw, Z8F);
-      if (z1.length < sz) { z = z1; sz = z1.length; }
+    // Re-rank top multi-bpp non-photo contenders at level 8 only when close (eliminates Z6 ranking noise on i007/i002)
+    if (c.form.bpp > 1 && !c.isPhoto && topK.length < 3 && c.size <= bestZ6 * 1.015) {
+      const z0 = deflateSync(c.raw, Z8);
+      c.z = z0;
+      c.size = z0.length + chunkOverhead(c.form);
     }
-    c.z = z;
-    c.size = sz + chunkOverhead(c.form);
     topK.push(c);
     return true;
   };
@@ -1152,13 +1154,13 @@ function encodeCand(c, width, height, settings) {
 }
 
 // Deterministic byte-counted work budget (never reads wall clock).
-const DEF_1BPP_SM = { cut: 320, hc3Cut: 24, hc4Cut: 64, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 1, passes: 2, minSyms: 64,  initChunks: 185, dpCap: 56, blockAltBasin: true };
-const DEF_1BPP    = { cut: 208, hc3Cut: 12, hc4Cut: 36, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 128, initChunks: 155, dpCap: 46, blockAltBasin: true };
-const DEF_NORM    = { cut: 160, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 145, dpCap: 42, blockAltBasin: false };
-const DEF_PHOTO   = { cut: 144, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 140, dpCap: 40, blockAltBasin: false };
-const DEF_LIGHT   = { cut: 128, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 130, dpCap: 38, blockAltBasin: false };
+const DEF_1BPP_SM = { cut: 288, hc3Cut: 20, hc4Cut: 52, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 64,  initChunks: 170, dpCap: 52, blockAltBasin: true };
+const DEF_1BPP    = { cut: 192, hc3Cut: 12, hc4Cut: 32, nice: 259, iters: 2, blockIters: 3, huffIters: 1, patience: 1, passes: 2, minSyms: 128, initChunks: 150, dpCap: 44, blockAltBasin: true };
+const DEF_NORM    = { cut: 112, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 130, dpCap: 38, blockAltBasin: false };
+const DEF_PHOTO   = { cut: 104, hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 125, dpCap: 36, blockAltBasin: false };
+const DEF_LIGHT   = { cut: 88,  hc3Cut: 0,  hc4Cut: 0,  nice: 259, iters: 1, blockIters: 1, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 110, dpCap: 32, blockAltBasin: false };
 
-const BUDGET = 14800;
+const BUDGET = 11500;
 const oneCost = (c) => 0.35 * (c.raw.length / 1024) + 12.0 * (c.size / 1024);
 
 // Phase 1: screen every image and immediately write verified zlib PNG so every instance holds a valid answer.
