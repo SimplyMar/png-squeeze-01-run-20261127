@@ -75,11 +75,22 @@ function analyzeRows(samples, width, height, bpp) {
   return { dup, trans, allZero };
 }
 
-function smartUpOverlay(types, info, minTrans = 2) {
+function smartUpOverlay(types, info, minTrans = 2, minRun = 1) {
   const out = types.slice();
   const { dup, trans, allZero } = info;
-  for (let y = 1; y < out.length; y++) {
-    if (dup[y] && !allZero[y] && trans[y] >= minTrans && out[y] !== 2 && out[y] !== 4) out[y] = 2;
+  const h = out.length;
+  let y = 1;
+  while (y < h) {
+    if (dup[y] && !allZero[y] && trans[y] >= minTrans && out[y] !== 2 && out[y] !== 4) {
+      let end = y + 1;
+      while (end < h && dup[end] && !allZero[end] && trans[end] >= minTrans && out[end] !== 2 && out[end] !== 4) end++;
+      if (end - y >= minRun) {
+        for (let k = y; k < end; k++) out[k] = 2;
+      }
+      y = end;
+    } else {
+      y++;
+    }
   }
   return out;
 }
@@ -151,13 +162,14 @@ function bruteRow(fRows, height, rowLen, level, bias) {
   return types;
 }
 
-/** Top-2 dictionary-carrying Viterbi DP over row strips with optional switch penalty. */
+/** Top-2 dictionary-carrying Viterbi DP over row strips with optional switch penalty (strat=-1 uses min(def, flt)). */
 function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allowed = [0, 1, 2, 3, 4], switchPenalty = 0) {
   const K = allowed.length;
   const nStrips = cuts.length - 1;
-  const dicts = Array.from({ length: K }, () => new Uint8Array(32768));
+  const maxDict = 32768;
+  const dicts = Array.from({ length: K }, () => new Uint8Array(maxDict));
   const dictLen = new Int32Array(K);
-  const nextDicts = Array.from({ length: K }, () => new Uint8Array(32768));
+  const nextDicts = Array.from({ length: K }, () => new Uint8Array(maxDict));
   const nextDictLen = new Int32Array(K);
   const dp = new Float64Array(K);
   const nextDp = new Float64Array(K);
@@ -165,11 +177,20 @@ function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allo
 
   const appendDict = (src, srcLen, chunk, dst) => {
     const cl = chunk.length;
-    if (cl >= 32768) { dst.set(chunk.subarray(cl - 32768)); return 32768; }
-    const keep = Math.min(srcLen, 32768 - cl);
+    if (cl >= maxDict) { dst.set(chunk.subarray(cl - maxDict)); return maxDict; }
+    const keep = Math.min(srcLen, maxDict - cl);
     dst.set(src.subarray(srcLen - keep, srcLen), 0);
     dst.set(chunk, keep);
     return keep + cl;
+  };
+
+  const scoreView = (view, dict) => {
+    const base = dict && dict.length ? { level, memLevel: 9, dictionary: dict } : { level, memLevel: 9 };
+    if (strategy !== -1) return deflateSync(view, { ...base, strategy }).length;
+    return Math.min(
+      deflateSync(view, { ...base, strategy: 0 }).length,
+      deflateSync(view, { ...base, strategy: 1 }).length,
+    );
   };
 
   for (let si = 0; si < nStrips; si++) {
@@ -178,7 +199,7 @@ function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allo
     if (si === 0) {
       for (let ai = 0; ai < K; ai++) {
         const view = fRows[allowed[ai]].subarray(at0, at1);
-        dp[ai] = deflateSync(view, { level, memLevel: 9, strategy }).length;
+        dp[ai] = scoreView(view, null);
         dictLen[ai] = appendDict(dicts[ai], 0, view, dicts[ai]);
         parent[ai] = ai;
       }
@@ -194,17 +215,17 @@ function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allo
     for (let ai = 0; ai < K; ai++) {
       const view = fRows[allowed[ai]].subarray(at0, at1);
       const dSame = dicts[ai].subarray(0, dictLen[ai]);
-      let bestC = dp[ai] + deflateSync(view, { level, memLevel: 9, strategy, dictionary: dSame }).length;
+      let bestC = dp[ai] + scoreView(view, dSame);
       let bp = ai;
       if (b0 !== ai) {
         const dSw = dicts[b0].subarray(0, dictLen[b0]);
-        const cSw = dp[b0] + deflateSync(view, { level, memLevel: 9, strategy, dictionary: dSw }).length + switchPenalty;
+        const cSw = dp[b0] + scoreView(view, dSw) + switchPenalty;
         if (cSw < bestC) { bestC = cSw; bp = b0; }
       }
       const slack = (cuts.length > 2 && cuts[1] - cuts[0] >= 8) ? 250 : 60;
       if (b1 >= 0 && b1 !== ai && b1 !== b0 && dp[b1] <= dp[b0] + slack) {
         const dSw2 = dicts[b1].subarray(0, dictLen[b1]);
-        const cSw2 = dp[b1] + deflateSync(view, { level, memLevel: 9, strategy, dictionary: dSw2 }).length + switchPenalty;
+        const cSw2 = dp[b1] + scoreView(view, dSw2) + switchPenalty;
         if (cSw2 < bestC) { bestC = cSw2; bp = b1; }
       }
       nextDp[ai] = bestC;
@@ -257,7 +278,12 @@ function snapTransitions(fRows, height, rowLen, types, level = 4, strategy = 0) 
         const ft = y < sp ? (y < minY ? out[y] : tL) : (y >= maxY ? out[y] : tR);
         winBuf.set(fRows[ft].subarray(y * rowLen, (y + 1) * rowLen), (y - winStart) * rowLen);
       }
-      return deflateSync(winBuf, dict.length ? { level, memLevel: 9, strategy, dictionary: dict } : { level, memLevel: 9, strategy }).length;
+      const base = dict.length ? { level, memLevel: 9, dictionary: dict } : { level, memLevel: 9 };
+      if (strategy !== -1) return deflateSync(winBuf, { ...base, strategy }).length;
+      return Math.min(
+        deflateSync(winBuf, { ...base, strategy: 0 }).length,
+        deflateSync(winBuf, { ...base, strategy: 1 }).length,
+      );
     };
 
     let bestY = e, bestS = evalAt(e);
@@ -277,10 +303,9 @@ function snapTransitions(fRows, height, rowLen, types, level = 4, strategy = 0) 
   return out;
 }
 
-/** Recombine two row-filter plans over band-row strips using 2-state dictionary Viterbi DP. */
-function recombine2(fRows, height, rowLen, planA, planB, band = 16, level = 6, strat = 0, swPen = 0) {
+/** Recombine two row-filter plans over arbitrary cuts (with optional lookahead rows) using 2-state dictionary Viterbi DP. */
+function recombine2Cuts(fRows, height, rowLen, planA, planB, cuts, level = 5, strat = 0, swPen = 0, lookRows = 0) {
   const plans = [planA, planB];
-  const cuts = fixedCuts(height, band);
   const nS = cuts.length - 1;
   const dicts = [new Uint8Array(32768), new Uint8Array(32768)];
   const dLen = new Int32Array(2);
@@ -301,20 +326,28 @@ function recombine2(fRows, height, rowLen, planA, planB, band = 16, level = 6, s
     dst.set(ch, keep);
     return keep + cl;
   };
-  const scoreChunk = (ch, dict) => {
+  const scoreChunk = (ch, dict, lk) => {
+    let target = ch;
+    if (lk && lk.length) {
+      target = new Uint8Array(ch.length + lk.length);
+      target.set(ch, 0);
+      target.set(lk, ch.length);
+    }
     const base = dict && dict.length ? { level, memLevel: 9, dictionary: dict } : { level, memLevel: 9 };
-    if (strat !== -1) return deflateSync(ch, { ...base, strategy: strat }).length;
+    if (strat !== -1) return deflateSync(target, { ...base, strategy: strat }).length;
     return Math.min(
-      deflateSync(ch, { ...base, strategy: 0 }).length,
-      deflateSync(ch, { ...base, strategy: 1 }).length,
+      deflateSync(target, { ...base, strategy: 0 }).length,
+      deflateSync(target, { ...base, strategy: 1 }).length,
     );
   };
   for (let si = 0; si < nS; si++) {
     const y0 = cuts[si], y1 = cuts[si + 1];
     const chs = [getChunk(planA, y0, y1), getChunk(planB, y0, y1)];
+    const y2 = lookRows > 0 ? Math.min(height, y1 + lookRows) : y1;
+    const lk = y2 > y1 ? getChunk(planA, y1, y2) : null;
     if (si === 0) {
       for (let a = 0; a < 2; a++) {
-        dp[a] = scoreChunk(chs[a], null);
+        dp[a] = scoreChunk(chs[a], null, lk);
         dLen[a] = app(dicts[a], 0, chs[a], dicts[a]);
         par[a] = a;
       }
@@ -323,7 +356,7 @@ function recombine2(fRows, height, rowLen, planA, planB, band = 16, level = 6, s
     for (let a = 0; a < 2; a++) {
       let bestC = Infinity, bp = a;
       for (let p = 0; p < 2; p++) {
-        const c = dp[p] + scoreChunk(chs[a], dicts[p].subarray(0, dLen[p])) + (p !== a ? swPen : 0);
+        const c = dp[p] + scoreChunk(chs[a], dicts[p].subarray(0, dLen[p]), lk) + (p !== a ? swPen : 0);
         if (c < bestC) { bestC = c; bp = p; }
       }
       nDp[a] = bestC;
@@ -346,6 +379,10 @@ function recombine2(fRows, height, rowLen, planA, planB, band = 16, level = 6, s
   return out;
 }
 
+function recombine2(fRows, height, rowLen, planA, planB, band = 16, level = 5, strat = 0, swPen = 0) {
+  return recombine2Cuts(fRows, height, rowLen, planA, planB, fixedCuts(height, band), level, strat, swPen, 0);
+}
+
 function fixedCuts(height, band) {
   const c = [0];
   for (let y = band; y < height; y += band) c.push(y);
@@ -353,10 +390,71 @@ function fixedCuts(height, band) {
   return c;
 }
 
+/** Centered L6 Transition + Row Post-Filter (evaluates downstream dictionary impact at level 6). */
+function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
+  const out = types.slice();
+  const maxWin = Math.max(4, Math.min(20, Math.floor(32768 / rowLen)));
+  const backRows = maxWin;
+  const fwdRows = bpp === 1 ? Math.min(16, maxWin) : maxWin;
+  const buf = new Uint8Array((backRows + fwdRows + 4) * rowLen);
+
+  const scoreRange = (yA, yB, fCand) => {
+    const y0 = Math.max(0, yA - backRows);
+    const y1 = Math.min(height, yB + fwdRows);
+    const dRows = yA - y0;
+    for (let y = y0; y < y1; y++) {
+      const f = (y >= yA && y < yB && fCand >= 0) ? fCand : out[y];
+      buf.set(fRows[f].subarray(y * rowLen, (y + 1) * rowLen), (y - y0) * rowLen);
+    }
+    const dict = dRows > 0 ? buf.subarray(0, dRows * rowLen) : null;
+    const body = buf.subarray(dRows * rowLen, (y1 - y0) * rowLen);
+    const base = dict ? { level: 6, memLevel: 9, strategy: 0, dictionary: dict } : { level: 6, memLevel: 9, strategy: 0 };
+    return deflateSync(body, base).length;
+  };
+
+  // Pass 1: Transition L6 Polish (up to +-10 rows)
+  for (let pass = 0; pass < 2; pass++) {
+    let mv = 0;
+    for (let y = 1; y < height; y++) {
+      if (out[y] === out[y - 1]) continue;
+      const fL = out[y - 1], fR = out[y];
+      let cur = y, steps = 0;
+      while (cur < height && out[cur] === fR && steps < 10) {
+        if (scoreRange(cur, cur + 1, fL) < scoreRange(cur, cur + 1, fR)) { out[cur] = fL; cur++; steps++; mv++; }
+        else break;
+      }
+      if (steps > 0) { y = cur; continue; }
+      cur = y - 1; steps = 0;
+      while (cur >= 0 && out[cur] === fL && steps < 10) {
+        if (scoreRange(cur, cur + 1, fR) < scoreRange(cur, cur + 1, fL)) { out[cur] = fR; cur--; steps++; mv++; }
+        else break;
+      }
+    }
+    if (!mv) break;
+  }
+
+  // Pass 2: 1-pass Centered L6 Row Post-Filter (skips all-zero or exact-dup rows already inside a uniform f=0 band)
+  const margin = bpp === 1 ? 1 : 0;
+  const allZero = info ? info.allZero : null;
+  const dup = info ? info.dup : null;
+  for (let y = 0; y < height; y++) {
+    const curF = out[y];
+    if (curF === 0 && y > 0 && y + 1 < height && out[y - 1] === 0 && out[y + 1] === 0 && ((allZero && allZero[y]) || (bpp > 1 && dup && dup[y] && info.trans[y] < 2))) continue;
+    let bestF = curF, bestS = scoreRange(y, y + 1, curF) - margin;
+    for (let f = 0; f < 5; f++) {
+      if (f === curF) continue;
+      const s = scoreRange(y, y + 1, f);
+      if (s < bestS) { bestS = s; bestF = f; }
+    }
+    if (bestF !== curF) out[y] = bestF;
+  }
+  return out;
+}
+
 function screen(rgba, width, height) {
   const { opaque, grey, colours } = analyse(rgba);
   const rawCands = [];
-  const push = (name, form, fRows, rowLen, types, isPhoto = false) => {
+  const push = (name, form, fRows, rowLen, types, isPhoto = false, info = null) => {
     const raw = assembleFromFRows(fRows, height, rowLen, types);
     const z0 = deflateSync(raw, Z6);
     let z = z0, sz = z0.length;
@@ -369,6 +467,9 @@ function screen(rgba, width, height) {
       form: { colourType: form.colourType, bpp: form.bpp, plte: form.plte, trns: form.trns },
       rowLen,
       raw,
+      fRows,
+      types,
+      info,
       z,
       size: sz + chunkOverhead(form),
       isPhoto,
@@ -382,25 +483,39 @@ function screen(rgba, width, height) {
     const fRows = precomputeFilteredRows(form.samples, width, height, 1, [0, 1, 2, 3, 4]);
     const info = analyzeRows(form.samples, width, height, 1);
     const f0 = new Uint8Array(height).fill(0);
-    const f0su1 = smartUpOverlay(f0, info, 1);
+    const f0su1 = smartUpOverlay(f0, info, 1, 1);
+    const f0su1r2 = smartUpOverlay(f0, info, 1, 2);
     push('f0', form, fRows, rowLen, f0);
     push('f0+su1', form, fRows, rowLen, f0su1);
+    push('f0+su1r2', form, fRows, rowLen, f0su1r2);
     push('rec_f0_su1', form, fRows, rowLen, recombine2(fRows, height, rowLen, f0, f0su1, 16, 6, 0, 0));
+    push('rec_f0_su1_8', form, fRows, rowLen, recombine2(fRows, height, rowLen, f0, f0su1, 8, 6, 0, 0));
+    // Natural dup-run boundary recombination with 8-row lookahead (captures dictionary impact on subsequent UI rows!)
+    const natCuts = [0];
+    for (let y = 1; y < height; y++) if (f0su1[y] === 2 && f0su1[y - 1] === 0) natCuts.push(y);
+    natCuts.push(height);
+    if (natCuts.length >= 4 && natCuts.length <= 160) {
+      push('nat_lk8', form, fRows, rowLen, recombine2Cuts(fRows, height, rowLen, f0, f0su1, natCuts, 6, 0, 0, 8));
+    }
     const v02 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 6, 0, [0, 2]);
-    const v02s = snapTransitions(fRows, height, rowLen, v02, 4, 0);
+    const v02s = snapTransitions(fRows, height, rowLen, v02, 3, 0);
     push('v02_8+snap', form, fRows, rowLen, v02s);
-    push('v02_8+snap+su1', form, fRows, rowLen, smartUpOverlay(v02s, info, 1));
+    push('v02_8+snap+su1', form, fRows, rowLen, smartUpOverlay(v02s, info, 1, 1));
     push('rec_su1_v02', form, fRows, rowLen, recombine2(fRows, height, rowLen, f0su1, v02s, 16, 6, 0, 0));
 
-    // Also allow all 5 filters + TSP palette reordering when filtered rows beat F0!
+    // Allow all 5 filters + recombination with f0su1 (captures charts/gradients embedded in flat UI like i005!)
     const z0 = deflateSync(fRows[0], Z6).length;
     const z4 = deflateSync(fRows[4], Z6).length;
     const z2 = deflateSync(fRows[2], Z6).length;
-    if (Math.min(z4, z2) < z0 * 1.08) {
+    if (Math.min(z4, z2) < z0 * 1.25) {
       const vAll = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), 5, 0, [0, 1, 2, 3, 4]);
       const vAllS = snapTransitions(fRows, height, rowLen, vAll, 3, 0);
       push('vall_8+snap', form, fRows, rowLen, vAllS);
-      push('vall_8+snap+su1', form, fRows, rowLen, smartUpOverlay(vAllS, info, 1));
+      push('vall_8+snap+su1', form, fRows, rowLen, smartUpOverlay(vAllS, info, 1, 1));
+      const recAll = recombine2(fRows, height, rowLen, f0su1, vAllS, 16, 6, 0, 0);
+      const recAllS = snapTransitions(fRows, height, rowLen, recAll, 3, 0);
+      push('rec_su1_vall', form, fRows, rowLen, recAllS);
+      push('rec_su1_vall+su1', form, fRows, rowLen, smartUpOverlay(recAllS, info, 1, 1));
 
       if (z4 < z0 * 0.96) {
         const tspOrd = tspPaletteOrder(rgba, width, height, byCount);
@@ -410,7 +525,7 @@ function screen(rgba, width, height) {
         const tvAll = stripViterbiDict(tspRows, height, rowLen, fixedCuts(height, 8), 5, 0, [0, 1, 2, 3, 4]);
         const tvAllS = snapTransitions(tspRows, height, rowLen, tvAll, 3, 0);
         push('tsp_vall+snap', tspForm, tspRows, rowLen, tvAllS);
-        push('tsp_vall+snap+su1', tspForm, tspRows, rowLen, smartUpOverlay(tvAllS, tspInfo, 1));
+        push('tsp_vall+snap+su1', tspForm, tspRows, rowLen, smartUpOverlay(tvAllS, tspInfo, 1, 1));
       }
     }
   } else {
@@ -431,73 +546,90 @@ function screen(rgba, width, height) {
     const judgeStrat = isPhoto ? 1 : 0;
 
     const f0 = new Uint8Array(height).fill(0);
-    push('f0', form, fRows, rowLen, f0, isPhoto);
-    push('f0+su2', form, fRows, rowLen, smartUpOverlay(f0, info, 2), isPhoto);
+    push('f0', form, fRows, rowLen, f0, isPhoto, info);
+    push('f0+su2', form, fRows, rowLen, smartUpOverlay(f0, info, 2, 1), isPhoto, info);
 
     let br = null;
     if (grey) {
-      br = bruteRow(fRows, height, rowLen, z4min > 120000 ? 3 : 4, 4);
-      push('brute4', form, fRows, rowLen, br, isPhoto);
-      push('brute4+su2', form, fRows, rowLen, smartUpOverlay(br, info, 2), isPhoto);
+      br = bruteRow(fRows, height, rowLen, z4min > 125000 ? 3 : 4, isPhoto ? 2 : 4);
+      push('brute4', form, fRows, rowLen, br, isPhoto, info);
+      push('brute4+su2', form, fRows, rowLen, smartUpOverlay(br, info, 2, 1), isPhoto, info);
     }
 
-    const v16 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 16), 6, judgeStrat);
-    const v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), heavy ? 5 : 6, judgeStrat, [0, 1, 2, 3, 4], isPhoto ? 20 : 0);
-    const z16 = deflateSync(assembleFromFRows(fRows, height, rowLen, v16), isPhoto ? Z6F : Z6).length;
+    const v16 = isPhoto ? null : stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 16), 6, judgeStrat);
+    const v8Strat = (!grey && isPhoto) ? -1 : judgeStrat;
+    const v8 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 8), (heavy || (!grey && isPhoto)) ? 5 : 6, v8Strat, [0, 1, 2, 3, 4], isPhoto ? 15 : 0);
+    const z16 = v16 ? deflateSync(assembleFromFRows(fRows, height, rowLen, v16), isPhoto ? Z6F : Z6).length : Infinity;
     const z8 = deflateSync(assembleFromFRows(fRows, height, rowLen, v8), isPhoto ? Z6F : Z6).length;
 
-    const v16s = snapTransitions(fRows, height, rowLen, v16, 4, judgeStrat);
-    push('vit16+snap', form, fRows, rowLen, v16s, isPhoto);
-    push('vit16+snap+su', form, fRows, rowLen, smartUpOverlay(v16s, info, 2), isPhoto);
+    let v16s = null;
+    if (v16) {
+      v16s = snapTransitions(fRows, height, rowLen, v16, 4, judgeStrat);
+      push('vit16+snap', form, fRows, rowLen, v16s, isPhoto, info);
+      push('vit16+snap+su', form, fRows, rowLen, smartUpOverlay(v16s, info, 2, 1), isPhoto, info);
+    }
 
     let v8s = null;
     if (!heavy || z8 <= z16 * 1.02) {
-      v8s = snapTransitions(fRows, height, rowLen, v8, 4, judgeStrat);
-      push('vit8+snap', form, fRows, rowLen, v8s, isPhoto);
-      push('vit8+snap+su', form, fRows, rowLen, smartUpOverlay(v8s, info, 2), isPhoto);
+      v8s = snapTransitions(fRows, height, rowLen, v8, (!grey && isPhoto) ? 5 : 4, v8Strat);
+      push((!grey && isPhoto) ? 'vdual8+snap' : 'vit8+snap', form, fRows, rowLen, v8s, isPhoto, info);
+      push((!grey && isPhoto) ? 'vdual8+snap+su' : 'vit8+snap+su', form, fRows, rowLen, smartUpOverlay(v8s, info, 2, 1), isPhoto, info);
     }
 
-    // On non-photo grey images, probe fine Z_FILTERED Viterbi (4-row & 2-row) to capture subtle gradients/UI regions
     if (grey && !isPhoto && !heavy) {
-      const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), 5, 1, [0, 1, 2, 3, 4], 20);
+      const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), 5, 1, [0, 1, 2, 3, 4], 15);
       const v4fs = snapTransitions(fRows, height, rowLen, v4f, 4, 1);
-      push('vit4f+snap', form, fRows, rowLen, v4fs, false);
+      push('vit4f+snap', form, fRows, rowLen, v4fs, false, info);
       const v2f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 2), 5, 1, [0, 1, 2, 3, 4], 15);
       const v2fs = snapTransitions(fRows, height, rowLen, v2f, 4, 1);
-      push('vit2f+snap', form, fRows, rowLen, v2fs, false);
-    } else if (grey && isPhoto && br && v8s) {
-      const recBr = recombine2(fRows, height, rowLen, br, v8s, 16, z4min > 120000 ? 4 : 6, judgeStrat, 0);
-      push('rec_br_v8', form, fRows, rowLen, recBr, isPhoto);
+      push('vit2f+snap', form, fRows, rowLen, v2fs, false, info);
+      // Untrapped dual-plan recombination for non-photo grey hybrids (e.g. i008)
+      const baseDef = z16 <= z8 ? v16s : (v8s || v16s);
+      const recG = recombine2(fRows, height, rowLen, baseDef, v4fs, 16, 5, -1, 0);
+      const recGS = snapTransitions(fRows, height, rowLen, recG, 4, 0);
+      push('rec_g_def_v4f+snap', form, fRows, rowLen, recGS, false, info);
+    } else if (grey && isPhoto && br) {
+      if (v8s) {
+        const recBr = recombine2(fRows, height, rowLen, br, v8s, 16, z4min > 120000 ? 4 : 5, -1, 0);
+        push('rec_br_v8', form, fRows, rowLen, recBr, isPhoto, info);
+      }
     }
 
-    // On non-photo multi-bpp (rich UI+photo hybrids like i002), untrapped dual-plan recombination beats single strategy!
-    if (!grey && !isPhoto && !heavy && v8s && z8 <= z16 * 1.01) {
-      const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), 5, 1, [0, 1, 2, 3, 4], 15);
-      const rec = recombine2(fRows, height, rowLen, v8s, v4f, 16, 6, -1, 0);
-      const recS = snapTransitions(fRows, height, rowLen, rec, 4, 0);
-      push('rec_v8_v4f+snap', form, fRows, rowLen, recS, false);
-      push('rec_v8_v4f+snap+su', form, fRows, rowLen, smartUpOverlay(recS, info, 2), false);
-    }
-
-    // Add finer 4-row Viterbi with switch penalty on photo-like images when vit8 beats vit16 (e.g. gallery layouts)
-    if (isPhoto && !heavy && z8 <= z16 * 1.01) {
-      const v4 = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), 5, judgeStrat, [0, 1, 2, 3, 4], 15);
-      const v4s = snapTransitions(fRows, height, rowLen, v4, 4, judgeStrat);
-      push('vit4+snap', form, fRows, rowLen, v4s, isPhoto);
-      push('vit4+snap+su', form, fRows, rowLen, smartUpOverlay(v4s, info, 2), isPhoto);
+    // Universal untrapped dual-plan recombination for non-heavy multi-bpp (both photo and UI+photo hybrids!)
+    if (!grey && !heavy) {
+      const v4f = stripViterbiDict(fRows, height, rowLen, fixedCuts(height, 4), isPhoto ? 5 : 4, 1, [0, 1, 2, 3, 4], 15);
+      const v4fs = snapTransitions(fRows, height, rowLen, v4f, 4, isPhoto ? -1 : 1);
+      if (isPhoto) {
+        push('vit4+snap', form, fRows, rowLen, v4fs, true, info);
+        push('vit4+snap+su', form, fRows, rowLen, smartUpOverlay(v4fs, info, 2, 1), true, info);
+        const recP = recombine2(fRows, height, rowLen, v8s || v16s, v4fs, 16, 5, -1, 0);
+        const recPS = snapTransitions(fRows, height, rowLen, recP, 5, -1);
+        push('rec_dual8_v4f+snap', form, fRows, rowLen, recPS, true, info);
+        push('rec_dual8_v4f+snap+su', form, fRows, rowLen, smartUpOverlay(recPS, info, 2, 1), true, info);
+      } else {
+        const baseDef = v8s || v16s;
+        const rec = recombine2(fRows, height, rowLen, baseDef, v4fs, 16, 5, -1, 0);
+        const recS = snapTransitions(fRows, height, rowLen, rec, 4, 0);
+        push('rec_v8_v4f+snap', form, fRows, rowLen, recS, false, info);
+        push('rec_v8_v4f+snap+su', form, fRows, rowLen, smartUpOverlay(recS, info, 2, 1), false, info);
+      }
     }
   }
 
   rawCands.sort((a, b) => a.size - b.size);
   const topK = [];
-  const seenSig = new Set();
-  const baseOf = (n) => n.replace('+su2', '').replace('+su1', '').replace('+su', '');
+  const baseOf = (n) => n.replace('+su2', '').replace('+su1r2', '').replace('+su1', '').replace('+su', '');
   const seenFamily = new Set();
 
+  const isDupRaw = (raw) => {
+    for (let i = 0; i < topK.length; i++) {
+      if (topK[i].raw.length === raw.length && Buffer.compare(topK[i].raw, raw) === 0) return true;
+    }
+    return false;
+  };
+
   const addCand = (c) => {
-    const sig = c.size + ':' + c.raw[0] + ':' + c.raw[c.raw.length >> 1] + ':' + c.raw[c.raw.length - 1];
-    if (seenSig.has(sig)) return false;
-    seenSig.add(sig);
+    if (isDupRaw(c.raw)) return false;
     const z0 = deflateSync(c.raw, Z8);
     let z = z0, sz = z0.length;
     if (c.isPhoto) {
@@ -510,29 +642,36 @@ function screen(rgba, width, height) {
     return true;
   };
 
-  // Keep top diverse candidates (always preserving v02_8+snap & f0+su1 on CT3, and vit4f+snap on non-photo grey!)
+  // Keep top diverse candidates (preserving high-value recombination & 1-bpp candidates for WASM pre-screen!)
   const bestZ6 = rawCands[0].size;
-  const maxK = rawCands[0].form.bpp === 1 ? 3 : 2;
+  const maxK = rawCands[0].form.bpp === 1 ? 4 : 3;
   for (const c of rawCands) {
     if (topK.length >= 2 && c.size > bestZ6 * 1.04) break;
     const fam = baseOf(c.name);
-    if (topK.length >= 2 && seenFamily.has(fam)) continue;
+    if (topK.length >= 1 && seenFamily.has(fam)) continue;
     if (addCand(c)) {
       seenFamily.add(fam);
       if (topK.length >= maxK) break;
     }
   }
   if (rawCands[0].form.colourType === 3) {
-    for (const must of ['rec_f0_su1', 'v02_8+snap', 'f0+su1']) {
+    for (const must of ['nat_lk8', 'rec_f0_su1', 'rec_f0_su1_8', 'rec_su1_vall+su1', 'f0+su1r2', 'rec_su1_v02']) {
       if (!seenFamily.has(baseOf(must))) {
         const found = rawCands.find((c) => c.name === must);
-        if (found) addCand(found);
+        if (found && addCand(found)) seenFamily.add(baseOf(must));
       }
     }
-  } else if (rawCands[0].form.colourType === 0 && !rawCands[0].isPhoto) {
-    for (const must of ['vit2f+snap', 'vit4f+snap']) {
+  } else if (rawCands[0].form.colourType === 0) {
+    const musts = rawCands[0].isPhoto ? ['dualvit1', 'rec_br_v1d', 'rec_br_v8'] : ['rec_g_def_v4f+snap', 'vit4f+snap', 'vit2f+snap'];
+    for (const must of musts) {
       const found = rawCands.find((c) => c.name === must);
-      if (found && !seenFamily.has(must)) addCand(found);
+      if (found && !seenFamily.has(baseOf(must)) && addCand(found)) seenFamily.add(baseOf(must));
+    }
+  } else {
+    const musts = rawCands[0].isPhoto ? ['vdual8+snap', 'rec_dual8_v4f+snap', 'rec_dual8_v4f+snap+su'] : ['rec_v8_v4f+snap'];
+    for (const must of musts) {
+      const found = rawCands.find((c) => c.name === must);
+      if (found && !seenFamily.has(baseOf(must)) && addCand(found)) seenFamily.add(baseOf(must));
     }
   }
   topK.sort((a, b) => a.size - b.size);
@@ -541,25 +680,62 @@ function screen(rgba, width, height) {
 
 function encodeCand(c, width, height, settings) {
   let idat = new Uint8Array(c.z.buffer, c.z.byteOffset, c.z.length);
+  let outForm = c.form;
   try {
-    const raw = deflateRaw(c.raw, { ...settings, bpp: c.form.bpp, rowLen: c.rowLen });
+    let palInv = null;
+    let verifyRaw = c.raw;
+    const palSize = c.form.colourType === 3 && c.form.plte ? (c.form.plte.length / 3) : 0;
+    const raw = deflateRaw(c.raw, {
+      ...settings,
+      bpp: c.form.bpp,
+      rowLen: c.rowLen,
+      isPhoto: c.isPhoto,
+      paletteSize: palSize,
+      onPalPerm: palSize >= 4 ? (inv, _fwd, remapped) => { palInv = inv; verifyRaw = remapped; } : null,
+    });
     const back = inflateRawSync(raw);
-    if (Buffer.compare(back, Buffer.from(c.raw.buffer, c.raw.byteOffset, c.raw.length)) === 0 && raw.length + 6 < idat.length) {
-      idat = zlibWrap(raw, c.raw);
+    if (Buffer.compare(back, Buffer.from(verifyRaw.buffer, verifyRaw.byteOffset, verifyRaw.length)) === 0 && raw.length + 6 < idat.length) {
+      idat = zlibWrap(raw, verifyRaw);
+      if (palInv) {
+        const K = palInv.length;
+        const nPlte = new Uint8Array(K * 3);
+        for (let ni = 0; ni < K; ni++) {
+          const oi = palInv[ni];
+          nPlte[ni * 3] = c.form.plte[oi * 3];
+          nPlte[ni * 3 + 1] = c.form.plte[oi * 3 + 1];
+          nPlte[ni * 3 + 2] = c.form.plte[oi * 3 + 2];
+        }
+        let nTrns = null;
+        if (c.form.trns) {
+          const oldT = c.form.trns;
+          const tmpT = new Uint8Array(K);
+          let lastNonOpaque = -1;
+          for (let ni = 0; ni < K; ni++) {
+            const oi = palInv[ni];
+            const a = oi < oldT.length ? oldT[oi] : 255;
+            tmpT[ni] = a;
+            if (a !== 255) lastNonOpaque = ni;
+          }
+          if (lastNonOpaque >= 0) nTrns = tmpT.subarray(0, lastNonOpaque + 1);
+        }
+        outForm = { ...c.form, plte: nPlte, trns: nTrns };
+      }
     }
   } catch {
     // Keep verified zlib stream.
   }
-  return pngOf(width, height, c.form, idat);
+  return pngOf(width, height, outForm, idat);
 }
 
 // Deterministic byte-counted work budget (never reads wall clock).
-const DEF_1BPP  = { cut: 384, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 2, passes: 2, initChunks: 175, dpCap: 54, blockAltBasin: true };
-const DEF_2ND   = { cut: 256, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 2, passes: 1, initChunks: 150, dpCap: 40, blockAltBasin: false };
-const DEF_NORM  = { cut: 256, nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 2, passes: 2, initChunks: 165, dpCap: 48, blockAltBasin: true };
-const DEF_LIGHT = { cut: 128, nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, initChunks: 125, dpCap: 0,  blockAltBasin: false };
+const DEF_1BPP_SM = { cut: 512, hc3Cut: 48, hc4Cut: 128, nice: 259, iters: 4, blockIters: 5, huffIters: 2, patience: 2, passes: 2, minSyms: 64,  initChunks: 200, dpCap: 70, blockAltBasin: true };
+const DEF_1BPP    = { cut: 256, hc3Cut: 32, hc4Cut: 80,  nice: 259, iters: 3, blockIters: 5, huffIters: 2, patience: 2, passes: 2, minSyms: 128, initChunks: 180, dpCap: 60, blockAltBasin: true };
+const DEF_2ND     = { cut: 192, hc3Cut: 16, hc4Cut: 48,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 192, initChunks: 140, dpCap: 40, blockAltBasin: false };
+const DEF_NORM    = { cut: 256, hc3Cut: 0,  hc4Cut: 8,   nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 165, dpCap: 56, blockAltBasin: true };
+const DEF_PHOTO   = { cut: 224, hc3Cut: 0,  hc4Cut: 16,  nice: 259, iters: 2, blockIters: 2, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 165, dpCap: 56, blockAltBasin: true };
+const DEF_LIGHT   = { cut: 160, hc3Cut: 0,  hc4Cut: 16,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 150, dpCap: 48, blockAltBasin: true };
 
-const BUDGET = 18500;
+const BUDGET = 14800;
 const oneCost = (c) => 0.35 * (c.raw.length / 1024) + 12.0 * (c.size / 1024);
 
 // Phase 1: screen every image and immediately write verified zlib PNG so every instance holds a valid answer.
@@ -594,11 +770,12 @@ for (const [id, s] of screened) {
     const isLight = light.has(id);
     const bpp = s.best.form.bpp;
 
-    // Fast WASM pre-screen on 1-bpp images to eliminate zlib block-splitting bias
+    // Fast WASM pre-screen on 1-bpp non-photo images (eliminates zlib bias on palette & grey hybrids without wasting multi-bpp time)
     let chosen = s.best;
     let runnerUp = null;
-    if (!isLight && bpp === 1 && s.cands.length > 1) {
-      const pool = s.cands.filter((c, i) => i === 0 || (i < 4 && c.size <= s.best.size * 1.035));
+    if (!isLight && bpp === 1 && !s.best.isPhoto && s.cands.length > 1) {
+      const maxPool = s.best.form.colourType === 3 ? 6 : 4;
+      const pool = s.cands.filter((c, i) => i === 0 || (i < maxPool && c.size <= s.best.size * 1.04));
       if (pool.length > 1) {
         const ranked = pool.map((c) => ({
           c,
@@ -606,13 +783,26 @@ for (const [id, s] of screened) {
         }));
         ranked.sort((a, b) => a.est - b.est);
         chosen = ranked[0].c;
-        if (ranked.length > 1 && ranked[1].est <= ranked[0].est * 1.0025) {
+        const runRatio = chosen.size < 25000 ? 1.0035 : 1.0012;
+        if (chosen.size < 45000 && ranked.length > 1 && ranked[1].est <= ranked[0].est * runRatio) {
           runnerUp = ranked[1].c;
         }
       }
     }
 
-    const settings = isLight ? DEF_LIGHT : (bpp === 1 ? DEF_1BPP : DEF_NORM);
+    // Centered L6 Post-Filter on the winning non-palette non-photo candidate (one pass, guarded by global z8 check)
+    if (!isLight && !chosen.isPhoto && chosen.form.colourType !== 3 && chosen.fRows && chosen.types) {
+      const polTypes = centeredPostFilterL6(chosen.fRows, s.height, chosen.rowLen, chosen.types, chosen.form.bpp, chosen.info);
+      const polRaw = assembleFromFRows(chosen.fRows, s.height, chosen.rowLen, polTypes);
+      const zP = deflateSync(polRaw, Z8);
+      if (zP.length + chunkOverhead(chosen.form) < chosen.size) {
+        chosen = { ...chosen, raw: polRaw, types: polTypes, z: zP, size: zP.length + chunkOverhead(chosen.form) };
+      }
+    }
+
+    const settings = isLight
+      ? DEF_LIGHT
+      : (bpp === 1 ? (chosen.size < 35000 ? DEF_1BPP_SM : DEF_1BPP) : (chosen.isPhoto ? DEF_PHOTO : DEF_NORM));
     let bestPng = encodeCand(chosen, s.width, s.height, settings);
     if (!isLight && runnerUp) {
       const altPng = encodeCand(runnerUp, s.width, s.height, DEF_2ND);
