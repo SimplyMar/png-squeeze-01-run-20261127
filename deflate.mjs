@@ -286,7 +286,7 @@ function headerPlan(llLens, dLens, full = false) {
     }
   }
   scoreRle(bestRleSym, bestM);
-  for (let it = 0; it < 4; it++) {
+  for (let it = 0; it < 2; it++) {
     for (let s = 0; s < 19; s++) clCostBuf[s] = clLens[s] > 0 ? clLens[s] : 8;
     const m = rleDP(allLens, n, clCostBuf, tmpRleSym, tmpRleExt);
     const bits = scoreRle(tmpRleSym, m);
@@ -1189,7 +1189,7 @@ function splitAndOptimize(eng, L, data, rowLen, bpp, tryDists, baseL, baseD, bas
       bl.set(baseL.subarray(a, z));
       bd.set(baseD.subarray(a, z));
       r = iterateRange(eng, L, data, s, e, bl, bd, z - a, blockIters, huffIters, patience, bpp, tryDists, tmpA_L, tmpA_D, tmpB_L, tmpB_D);
-      if (blockAltBasin && (z - a) >= 800) {
+      if (blockAltBasin && (z - a) >= (bpp === 1 ? 800 : 1800)) {
         let lits = 0;
         for (let i = 0; i < r.m; i++) if (bd[i] === 0) lits++;
         let altKind = null;
@@ -1284,7 +1284,7 @@ export function deflateRawWasm(data, opts = {}) {
   const dpCap = opts.dpCap ?? 60;
   const passes = opts.passes ?? 2;
   const isPhoto = opts.isPhoto ?? false;
-  const basins = opts.basins ?? (isPhoto ? ['litheavy', 'fixed'] : (bpp > 1 ? ['fixed', 'pixdist', 'litheavy'] : ['fixed', 'litheavy']));
+  const basins = opts.basins ?? (isPhoto ? ['litheavy', 'fixed'] : ['fixed', 'litheavy']);
   const blockAltBasin = opts.blockAltBasin ?? true;
 
   const hc3Cut = opts.hc3Cut ?? (bpp === 1 ? 48 : 16);
@@ -1474,7 +1474,7 @@ export function deflateRawWasm(data, opts = {}) {
 export function estimateDeflateBytes(data, bpp = 1, rowLen = 0, isPhoto = false) {
   const n = data.length;
   const eng = getWasmEngine();
-  const L = eng.prepareMatches(data, bpp === 1 ? 32 : 28, 259, bpp, rowLen, 0, 0);
+  const L = eng.prepareMatches(data, 20, 259, bpp, rowLen, 0, 0);
   const gL = new Uint16Array(n + 1);
   const gD = new Uint16Array(n + 1);
 

@@ -1111,7 +1111,7 @@ export function getWasmEngine() {
 
   function prepareMatches(data, cut = 256, nice = 259, bpp = 1, rowLen = 0, hc3Cut = 64, hc4Cut = 128) {
     const n = data.length;
-    let matchCap = Math.max(3_000_000, n * 6);
+    let matchCap = Math.max(3_000_000, n * 4);
     for (;;) {
       const L = layout(n, matchCap);
       new Uint8Array(memory.buffer, L.dataPtr, n).set(data);

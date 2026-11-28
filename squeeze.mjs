@@ -152,7 +152,7 @@ function bruteRow(fRows, height, rowLen, level, bias) {
     let best = Infinity, bt = 0;
     for (let t = 0; t < 5; t++) {
       const row = fRows[t].subarray(at, at + rowLen);
-      let c = deflateSync(row, dict.length ? { level, memLevel: 9, dictionary: dict } : { level, memLevel: 9 }).length;
+      let c = deflateSync(row, dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 }).length;
       if (bias && y > 0 && t === types[y - 1]) c -= bias;
       if (c < best) { best = c; bt = t; }
     }
@@ -185,7 +185,7 @@ function stripViterbiDict(fRows, height, rowLen, cuts, level, strategy = 0, allo
   };
 
   const scoreView = (view, dict) => {
-    const base = dict && dict.length ? { level, memLevel: 9, dictionary: dict } : { level, memLevel: 9 };
+    const base = dict && dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 };
     if (strategy !== -1) return deflateSync(view, { ...base, strategy }).length;
     return Math.min(
       deflateSync(view, { ...base, strategy: 0 }).length,
@@ -278,7 +278,7 @@ function snapTransitions(fRows, height, rowLen, types, level = 4, strategy = 0) 
         const ft = y < sp ? (y < minY ? out[y] : tL) : (y >= maxY ? out[y] : tR);
         winBuf.set(fRows[ft].subarray(y * rowLen, (y + 1) * rowLen), (y - winStart) * rowLen);
       }
-      const base = dict.length ? { level, memLevel: 9, dictionary: dict } : { level, memLevel: 9 };
+      const base = dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 };
       if (strategy !== -1) return deflateSync(winBuf, { ...base, strategy }).length;
       return Math.min(
         deflateSync(winBuf, { ...base, strategy: 0 }).length,
@@ -333,7 +333,7 @@ function recombine2Cuts(fRows, height, rowLen, planA, planB, cuts, level = 5, st
       target.set(ch, 0);
       target.set(lk, ch.length);
     }
-    const base = dict && dict.length ? { level, memLevel: 9, dictionary: dict } : { level, memLevel: 9 };
+    const base = dict && dict.length ? { level, memLevel: 7, dictionary: dict } : { level, memLevel: 7 };
     if (strat !== -1) return deflateSync(target, { ...base, strategy: strat }).length;
     return Math.min(
       deflateSync(target, { ...base, strategy: 0 }).length,
@@ -408,7 +408,7 @@ function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
     }
     const dict = dRows > 0 ? buf.subarray(0, dRows * rowLen) : null;
     const body = buf.subarray(dRows * rowLen, (y1 - y0) * rowLen);
-    const base = dict ? { level: 6, memLevel: 9, strategy: 0, dictionary: dict } : { level: 6, memLevel: 9, strategy: 0 };
+    const base = dict ? { level: 6, memLevel: 7, strategy: 0, dictionary: dict } : { level: 6, memLevel: 7, strategy: 0 };
     return deflateSync(body, base).length;
   };
 
@@ -433,16 +433,27 @@ function centeredPostFilterL6(fRows, height, rowLen, types, bpp, info) {
     if (!mv) break;
   }
 
-  // Pass 2: 1-pass Centered L6 Row Post-Filter (skips all-zero or exact-dup rows already inside a uniform f=0 band)
+  // Pass 2: 1-pass Centered L6 Row Post-Filter (skips flat rows; pre-ranks {1,3,4} by residual sum to avoid redundant zlib calls)
   const margin = bpp === 1 ? 1 : 0;
   const allZero = info ? info.allZero : null;
   const dup = info ? info.dup : null;
   for (let y = 0; y < height; y++) {
     const curF = out[y];
-    if (curF === 0 && y > 0 && y + 1 < height && out[y - 1] === 0 && out[y + 1] === 0 && ((allZero && allZero[y]) || (bpp > 1 && dup && dup[y] && info.trans[y] < 2))) continue;
+    if (curF === 0 && y > 0 && y + 1 < height && out[y - 1] === 0 && out[y + 1] === 0 && ((allZero && allZero[y]) || (bpp > 1 && dup && dup[y] && info.trans[y] <= 2))) continue;
+    // Always consider 0 (None), 2 (Up), and best two of {1, 3, 4} by sum-of-abs residual (cuts ~20% of zlib calls cleanly).
+    const off = y * rowLen;
+    let s1 = 0, s3 = 0, s4 = 0;
+    const r1 = fRows[1], r3 = fRows[3], r4 = fRows[4];
+    for (let i = 1; i < rowLen; i++) {
+      const a = r1[off + i], b = r3[off + i], c = r4[off + i];
+      s1 += a < 128 ? a : 256 - a;
+      s3 += b < 128 ? b : 256 - b;
+      s4 += c < 128 ? c : 256 - c;
+    }
+    const dropF = (s3 >= s1 && s3 >= s4) ? 3 : ((s1 >= s3 && s1 >= s4) ? 1 : 4);
     let bestF = curF, bestS = scoreRange(y, y + 1, curF) - margin;
     for (let f = 0; f < 5; f++) {
-      if (f === curF) continue;
+      if (f === curF || f === dropF) continue;
       const s = scoreRange(y, y + 1, f);
       if (s < bestS) { bestS = s; bestF = f; }
     }
@@ -602,10 +613,6 @@ function screen(rgba, width, height) {
       if (isPhoto) {
         push('vit4+snap', form, fRows, rowLen, v4fs, true, info);
         push('vit4+snap+su', form, fRows, rowLen, smartUpOverlay(v4fs, info, 2, 1), true, info);
-        const recP = recombine2(fRows, height, rowLen, v8s || v16s, v4fs, 16, 5, -1, 0);
-        const recPS = snapTransitions(fRows, height, rowLen, recP, 5, -1);
-        push('rec_dual8_v4f+snap', form, fRows, rowLen, recPS, true, info);
-        push('rec_dual8_v4f+snap+su', form, fRows, rowLen, smartUpOverlay(recPS, info, 2, 1), true, info);
       } else {
         const baseDef = v8s || v16s;
         const rec = recombine2(fRows, height, rowLen, baseDef, v4fs, 16, 5, -1, 0);
@@ -668,14 +675,41 @@ function screen(rgba, width, height) {
       if (found && !seenFamily.has(baseOf(must)) && addCand(found)) seenFamily.add(baseOf(must));
     }
   } else {
-    const musts = rawCands[0].isPhoto ? ['vdual8+snap', 'rec_dual8_v4f+snap', 'rec_dual8_v4f+snap+su'] : ['rec_v8_v4f+snap'];
+    const musts = rawCands[0].isPhoto ? ['vdual8+snap'] : ['rec_v8_v4f+snap'];
     for (const must of musts) {
       const found = rawCands.find((c) => c.name === must);
       if (found && !seenFamily.has(baseOf(must)) && addCand(found)) seenFamily.add(baseOf(must));
     }
   }
   topK.sort((a, b) => a.size - b.size);
-  return { cands: topK, best: topK[0], width, height };
+
+  // Run Centered L6 Post-Filter right here while fRows is live, then immediately drop fRows to keep RSS < 250 MB!
+  let keepCands;
+  if (topK[0].form.bpp > 1) {
+    let best = topK[0];
+    if (!best.isPhoto && best.fRows && best.types) {
+      let f0Cnt = 0;
+      for (let y = 0; y < height; y++) if (best.types[y] === 0) f0Cnt++;
+      if (f0Cnt < height * 0.85) {
+        const polTypes = centeredPostFilterL6(best.fRows, height, best.rowLen, best.types, best.form.bpp, best.info);
+        const polRaw = assembleFromFRows(best.fRows, height, best.rowLen, polTypes);
+        const zP = deflateSync(polRaw, Z8);
+        if (zP.length + chunkOverhead(best.form) < best.size) {
+          best = { ...best, raw: polRaw, types: polTypes, z: zP, size: zP.length + chunkOverhead(best.form) };
+        }
+      }
+    }
+    keepCands = [{ name: best.name, form: best.form, rowLen: best.rowLen, raw: best.raw, z: best.z, size: best.size, isPhoto: best.isPhoto }];
+  } else {
+    // 1-bpp: keep samples reference only for non-photo grey (0.9 MB) so Phase 2 can post-filter the PS winner without holding 5x fRows!
+    const keepGreySamples = (!topK[0].isPhoto && topK[0].form.colourType === 0) ? topK[0].fRows[0] : null;
+    keepCands = topK.map((c) => ({
+      name: c.name, form: c.form, rowLen: c.rowLen, raw: c.raw, types: keepGreySamples ? c.types : null,
+      info: keepGreySamples ? c.info : null, z: c.z, size: c.size, isPhoto: c.isPhoto,
+    }));
+    return { cands: keepCands, best: keepCands[0], width, height, greyF0: keepGreySamples };
+  }
+  return { cands: keepCands, best: keepCands[0], width, height, greyF0: null };
 }
 
 function encodeCand(c, width, height, settings) {
@@ -728,12 +762,11 @@ function encodeCand(c, width, height, settings) {
 }
 
 // Deterministic byte-counted work budget (never reads wall clock).
-const DEF_1BPP_SM = { cut: 512, hc3Cut: 48, hc4Cut: 128, nice: 259, iters: 4, blockIters: 5, huffIters: 2, patience: 2, passes: 2, minSyms: 64,  initChunks: 200, dpCap: 70, blockAltBasin: true };
-const DEF_1BPP    = { cut: 256, hc3Cut: 32, hc4Cut: 80,  nice: 259, iters: 3, blockIters: 5, huffIters: 2, patience: 2, passes: 2, minSyms: 128, initChunks: 180, dpCap: 60, blockAltBasin: true };
-const DEF_2ND     = { cut: 192, hc3Cut: 16, hc4Cut: 48,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 192, initChunks: 140, dpCap: 40, blockAltBasin: false };
-const DEF_NORM    = { cut: 256, hc3Cut: 0,  hc4Cut: 8,   nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 165, dpCap: 56, blockAltBasin: true };
-const DEF_PHOTO   = { cut: 224, hc3Cut: 0,  hc4Cut: 16,  nice: 259, iters: 2, blockIters: 2, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 165, dpCap: 56, blockAltBasin: true };
-const DEF_LIGHT   = { cut: 160, hc3Cut: 0,  hc4Cut: 16,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 2, minSyms: 256, initChunks: 150, dpCap: 48, blockAltBasin: true };
+const DEF_1BPP_SM = { cut: 320, hc3Cut: 24, hc4Cut: 64, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 1, passes: 2, minSyms: 64,  initChunks: 185, dpCap: 56, blockAltBasin: true };
+const DEF_1BPP    = { cut: 224, hc3Cut: 16, hc4Cut: 48, nice: 259, iters: 3, blockIters: 4, huffIters: 2, patience: 1, passes: 2, minSyms: 128, initChunks: 165, dpCap: 50, blockAltBasin: true };
+const DEF_NORM    = { cut: 224, hc3Cut: 0,  hc4Cut: 8,  nice: 259, iters: 2, blockIters: 3, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 155, dpCap: 48, blockAltBasin: true };
+const DEF_PHOTO   = { cut: 224, hc3Cut: 0,  hc4Cut: 16, nice: 259, iters: 2, blockIters: 2, huffIters: 2, patience: 1, passes: 2, minSyms: 256, initChunks: 155, dpCap: 48, blockAltBasin: true };
+const DEF_LIGHT   = { cut: 144, hc3Cut: 0,  hc4Cut: 8,  nice: 259, iters: 2, blockIters: 2, huffIters: 1, patience: 1, passes: 1, minSyms: 256, initChunks: 135, dpCap: 40, blockAltBasin: false };
 
 const BUDGET = 14800;
 const oneCost = (c) => 0.35 * (c.raw.length / 1024) + 12.0 * (c.size / 1024);
@@ -765,16 +798,17 @@ for (const [id, s] of [...screened].sort((a, b) => oneCost(b[1].best) - oneCost(
   total -= oneCost(s.best) * 0.45;
 }
 
-for (const [id, s] of screened) {
+for (const id of [...screened.keys()]) {
+  const s = screened.get(id);
+  screened.delete(id); // Release candidate buffers as soon as we finish each image to keep RSS well under 512 MB.
   try {
     const isLight = light.has(id);
     const bpp = s.best.form.bpp;
 
-    // Fast WASM pre-screen on 1-bpp non-photo images (eliminates zlib bias on palette & grey hybrids without wasting multi-bpp time)
+    // Fast WASM pre-screen on 1-bpp non-photo images (eliminates zlib bias on palette & grey hybrids)
     let chosen = s.best;
-    let runnerUp = null;
     if (!isLight && bpp === 1 && !s.best.isPhoto && s.cands.length > 1) {
-      const maxPool = s.best.form.colourType === 3 ? 6 : 4;
+      const maxPool = 4;
       const pool = s.cands.filter((c, i) => i === 0 || (i < maxPool && c.size <= s.best.size * 1.04));
       if (pool.length > 1) {
         const ranked = pool.map((c) => ({
@@ -783,31 +817,27 @@ for (const [id, s] of screened) {
         }));
         ranked.sort((a, b) => a.est - b.est);
         chosen = ranked[0].c;
-        const runRatio = chosen.size < 25000 ? 1.0035 : 1.0012;
-        if (chosen.size < 45000 && ranked.length > 1 && ranked[1].est <= ranked[0].est * runRatio) {
-          runnerUp = ranked[1].c;
-        }
       }
     }
 
-    // Centered L6 Post-Filter on the winning non-palette non-photo candidate (one pass, guarded by global z8 check)
-    if (!isLight && !chosen.isPhoto && chosen.form.colourType !== 3 && chosen.fRows && chosen.types) {
-      const polTypes = centeredPostFilterL6(chosen.fRows, s.height, chosen.rowLen, chosen.types, chosen.form.bpp, chosen.info);
-      const polRaw = assembleFromFRows(chosen.fRows, s.height, chosen.rowLen, polTypes);
+    // Centered L6 Post-Filter on non-photo grey winner (reconstruct 1-bpp samples from greyF0 in ~15 ms)
+    if (!isLight && s.greyF0 && chosen.types) {
+      const samples = new Uint8Array(s.width * s.height);
+      const rl = s.width + 1;
+      for (let y = 0; y < s.height; y++) samples.set(s.greyF0.subarray(y * rl + 1, (y + 1) * rl), y * s.width);
+      const fRows = precomputeFilteredRows(samples, s.width, s.height, 1, [0, 1, 2, 3, 4]);
+      const polTypes = centeredPostFilterL6(fRows, s.height, chosen.rowLen, chosen.types, 1, chosen.info);
+      const polRaw = assembleFromFRows(fRows, s.height, chosen.rowLen, polTypes);
       const zP = deflateSync(polRaw, Z8);
       if (zP.length + chunkOverhead(chosen.form) < chosen.size) {
-        chosen = { ...chosen, raw: polRaw, types: polTypes, z: zP, size: zP.length + chunkOverhead(chosen.form) };
+        chosen = { ...chosen, raw: polRaw, z: zP, size: zP.length + chunkOverhead(chosen.form) };
       }
     }
 
     const settings = isLight
       ? DEF_LIGHT
       : (bpp === 1 ? (chosen.size < 35000 ? DEF_1BPP_SM : DEF_1BPP) : (chosen.isPhoto ? DEF_PHOTO : DEF_NORM));
-    let bestPng = encodeCand(chosen, s.width, s.height, settings);
-    if (!isLight && runnerUp) {
-      const altPng = encodeCand(runnerUp, s.width, s.height, DEF_2ND);
-      if (altPng.length < bestPng.length) bestPng = altPng;
-    }
+    const bestPng = encodeCand(chosen, s.width, s.height, settings);
     writeFileSync(join(O, id, 'image.png'), bestPng);
   } catch {
     // Verified Phase 1 zlib PNG stands.
